@@ -94,7 +94,8 @@ def run_adsorption_workflow(
     pose_sampler = PoseSampler(cfg.pose_sampler_config)
     pose_frames: list[Atoms] = []
     for conformer_id, conformer in enumerate(conformers):
-        poses = pose_sampler.sample(
+        poses = _sample_with_fallback(
+            sampler=pose_sampler,
             slab=slab,
             adsorbate=conformer,
             primitives=primitives,
@@ -218,3 +219,42 @@ def run_adsorption_workflow(
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _sample_with_fallback(
+    sampler: PoseSampler,
+    slab: Atoms,
+    adsorbate: Atoms,
+    primitives: list[Any],
+    surface_atom_ids: list[int],
+) -> list[Any]:
+    poses = sampler.sample(
+        slab=slab,
+        adsorbate=adsorbate,
+        primitives=primitives,
+        surface_atom_ids=surface_atom_ids,
+    )
+    if poses:
+        return poses
+    span = _adsorbate_span(adsorbate)
+    retry_cfg = PoseSamplerConfig(**vars(sampler.config))
+    retry_cfg.min_height = float(max(retry_cfg.min_height, 1.8))
+    retry_cfg.max_height = float(max(retry_cfg.max_height + 0.8, retry_cfg.min_height + 1.0 + 0.15 * span))
+    retry_cfg.height_step = float(min(retry_cfg.height_step, 0.15))
+    retry_cfg.clash_tau = float(max(0.65, retry_cfg.clash_tau - 0.1))
+    retry_cfg.site_contact_tolerance = float(retry_cfg.site_contact_tolerance + 0.15)
+    retry_cfg.random_seed = int(retry_cfg.random_seed) + 17
+    retry_sampler = PoseSampler(retry_cfg)
+    return retry_sampler.sample(
+        slab=slab,
+        adsorbate=adsorbate,
+        primitives=primitives,
+        surface_atom_ids=surface_atom_ids,
+    )
+
+
+def _adsorbate_span(adsorbate: Atoms) -> float:
+    if len(adsorbate) <= 1:
+        return 0.0
+    pos = adsorbate.get_positions()
+    return float(max(pos.max(axis=0) - pos.min(axis=0)))
