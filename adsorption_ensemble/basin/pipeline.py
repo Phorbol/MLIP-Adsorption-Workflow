@@ -7,7 +7,11 @@ import numpy as np
 from ase import Atoms
 
 from adsorption_ensemble.basin.anomaly import classify_anomaly
-from adsorption_ensemble.basin.dedup import cluster_by_signature_and_mace_node_l2, cluster_by_signature_and_rmsd
+from adsorption_ensemble.basin.dedup import (
+    cluster_by_signature_and_mace_node_l2,
+    cluster_by_signature_and_rmsd,
+    cluster_by_signature_only,
+)
 from adsorption_ensemble.basin.types import Basin, BasinConfig, BasinResult, RejectedCandidate
 from adsorption_ensemble.relax.backends import IdentityRelaxBackend
 
@@ -85,15 +89,24 @@ class BasinBuilder:
             window_keep.append(a)
             window_energies.append(e)
             window_map_ids.append(int(kept_ids[j]))
-        basins_raw = cluster_by_signature_and_rmsd(
-            frames=window_keep,
-            energies=np.asarray(window_energies, dtype=float),
-            slab_n=int(slab_n),
-            binding_tau=float(cfg.binding_tau),
-            rmsd_threshold=float(cfg.rmsd_threshold),
-        )
+        dedup_metric = str(cfg.dedup_metric).strip().lower()
+        if dedup_metric in {"signature", "signature_only"}:
+            basins_raw = cluster_by_signature_only(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+            )
+        else:
+            basins_raw = cluster_by_signature_and_rmsd(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+                rmsd_threshold=float(cfg.rmsd_threshold),
+            )
         dedup_meta: dict = {}
-        if str(cfg.dedup_metric).strip().lower() in {"mace", "mace_node_l2", "mace_l2"}:
+        if dedup_metric in {"mace", "mace_node_l2", "mace_l2"}:
             basins_raw, dedup_meta = cluster_by_signature_and_mace_node_l2(
                 frames=window_keep,
                 energies=np.asarray(window_energies, dtype=float),

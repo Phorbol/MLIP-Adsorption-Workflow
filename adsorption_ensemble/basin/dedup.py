@@ -157,6 +157,47 @@ def cluster_by_signature_and_mace_node_l2(
     return basins, meta
 
 
+def cluster_by_signature_only(
+    frames: list[Atoms],
+    energies: np.ndarray,
+    slab_n: int,
+    binding_tau: float,
+) -> list[dict]:
+    items: list[dict] = []
+    for i, a in enumerate(frames):
+        pairs = build_binding_pairs(a, slab_n=slab_n, binding_tau=binding_tau)
+        sig = binding_signature(pairs)
+        items.append(
+            {
+                "candidate_id": int(i),
+                "atoms": a,
+                "energy": float(energies[i]) if i < len(energies) else float("nan"),
+                "binding_pairs": pairs,
+                "signature": sig,
+            }
+        )
+    by_sig: dict[str, list[dict]] = {}
+    for it in items:
+        by_sig.setdefault(str(it["signature"]), []).append(it)
+    basins: list[dict] = []
+    basin_id = 0
+    for sig, group in by_sig.items():
+        group = sorted(group, key=lambda x: (np.nan_to_num(x["energy"], nan=np.inf), x["candidate_id"]))
+        rep = group[0]
+        basins.append(
+            {
+                "basin_id": int(basin_id),
+                "atoms": rep["atoms"],
+                "energy": float(rep["energy"]),
+                "member_candidate_ids": [int(x["candidate_id"]) for x in group],
+                "binding_pairs": rep["binding_pairs"],
+                "signature": sig,
+            }
+        )
+        basin_id += 1
+    return basins
+
+
 def cluster_by_signature_and_rmsd(
     frames: list[Atoms],
     energies: np.ndarray,

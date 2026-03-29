@@ -8,7 +8,7 @@ from typing import Any
 from ase import Atoms
 from ase.io import write
 
-from adsorption_ensemble.basin import BasinBuilder, BasinConfig, BasinResult
+from adsorption_ensemble.basin import BasinBuilder, BasinConfig, BasinResult, build_basin_dictionary, run_basin_ablation
 from adsorption_ensemble.conformer_md import ConformerEnsemble, ConformerMDSampler, ConformerMDSamplerConfig
 from adsorption_ensemble.node import NodeConfig, ReactionNode, basin_to_node
 from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
@@ -31,6 +31,9 @@ class AdsorptionWorkflowConfig:
     save_surface_report: bool = True
     save_site_dictionary: bool = True
     save_pose_pool: bool = True
+    save_basin_dictionary: bool = True
+    save_basin_ablation: bool = False
+    basin_ablation_metrics: tuple[str, ...] = ("signature_only", "rmsd")
 
 
 @dataclass
@@ -187,6 +190,31 @@ def run_adsorption_workflow(
         ],
     )
     artifacts["nodes_json"] = nodes_json.as_posix()
+
+    if bool(cfg.save_basin_dictionary):
+        basin_dict = build_basin_dictionary(
+            basin_result,
+            pose_frames=pose_frames,
+            nodes=nodes,
+            slab_n=len(slab),
+        )
+        basin_dict_path = work_dir / "basin_dictionary.json"
+        _write_json(basin_dict_path, basin_dict)
+        artifacts["basin_dictionary_json"] = basin_dict_path.as_posix()
+    if bool(cfg.save_basin_ablation):
+        basin_ablation = run_basin_ablation(
+            frames=pose_frames,
+            slab_ref=slab,
+            adsorbate_ref=adsorbate,
+            slab_n=len(slab),
+            normal_axis=int(ctx.classification.normal_axis),
+            base_config=cfg.basin_config,
+            relax_backend=basin_relax_backend,
+            metrics=tuple(cfg.basin_ablation_metrics),
+        )
+        basin_ablation_path = work_dir / "basin_ablation.json"
+        _write_json(basin_ablation_path, basin_ablation)
+        artifacts["basin_ablation_json"] = basin_ablation_path.as_posix()
 
     summary = {
         "n_surface_atoms": int(len(ctx.detection.surface_atom_ids)),

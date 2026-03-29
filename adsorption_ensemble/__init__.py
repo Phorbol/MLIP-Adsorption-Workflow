@@ -56,7 +56,7 @@ from .conformer_md import (
     XTBMDConfig,
     XTBMDRunner,
 )
-from .basin import Basin, BasinBuilder, BasinConfig, BasinResult
+from .basin import Basin, BasinBuilder, BasinConfig, BasinResult, build_basin_dictionary, run_basin_ablation
 from .node import NodeConfig, ReactionNode, basin_to_node
 
 __all__ = [
@@ -126,6 +126,8 @@ __all__ = [
     "BasinConfig",
     "BasinResult",
     "BasinBuilder",
+    "build_basin_dictionary",
+    "run_basin_ablation",
     "NodeConfig",
     "ReactionNode",
     "basin_to_node",
