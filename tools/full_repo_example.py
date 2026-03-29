@@ -7,16 +7,14 @@ import sys
 
 import numpy as np
 from ase.build import fcc211, molecule
-from ase.io import write
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adsorption_ensemble.basin import BasinBuilder, BasinConfig
+from adsorption_ensemble.basin import BasinConfig
 from adsorption_ensemble.conformer_md import ConformerMDSampler, ConformerMDSamplerConfig, GeometryPairDistanceDescriptor, read_molecule_any
-from adsorption_ensemble.node import NodeConfig, basin_to_node
-from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
-from adsorption_ensemble.site import PrimitiveBuilder
-from adsorption_ensemble.surface import SurfacePreprocessor, export_surface_detection_report
+from adsorption_ensemble.node import NodeConfig
+from adsorption_ensemble.pose import PoseSamplerConfig
+from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, evaluate_adsorption_workflow_readiness, run_adsorption_workflow
 
 
 class FakeMDRunner:
@@ -53,12 +51,10 @@ def run_adsorption_api_example(
     out.mkdir(parents=True, exist_ok=True)
     slab = fcc211("Pt", size=(6, 4, 4), vacuum=12.0)
     ads = molecule("CO")
-    pre = SurfacePreprocessor(min_surface_atoms=6)
-    ctx = pre.build_context(slab)
-    export_surface_detection_report(slab, ctx, out / "surface_report")
-    primitives = PrimitiveBuilder().build(slab, ctx)
-    sampler = PoseSampler(
-        PoseSamplerConfig(
+    want_mace = bool(use_mace_dedup) and bool(mace_model_path) and Path(str(mace_model_path)).exists()
+    cfg = AdsorptionWorkflowConfig(
+        work_dir=out,
+        pose_sampler_config=PoseSamplerConfig(
             n_rotations=2,
             n_azimuth=6,
             n_shifts=1,
@@ -68,115 +64,43 @@ def run_adsorption_api_example(
             height_step=0.2,
             random_seed=0,
             max_poses_per_site=4,
-        )
-    )
-    poses = sampler.sample(
-        slab=slab,
-        adsorbate=ads,
-        primitives=primitives[:4],
-        surface_atom_ids=ctx.detection.surface_atom_ids,
-    )
-    pose_frames = [slab + p.atoms for p in poses]
-    if pose_frames:
-        write((out / "pose_pool.extxyz").as_posix(), pose_frames)
-    want_mace = bool(use_mace_dedup) and bool(mace_model_path) and Path(str(mace_model_path)).exists()
-    cfg = BasinConfig(
-        relax_maxf=0.10,
-        relax_steps=2,
-        energy_window_ev=1.0,
-        dedup_metric=("mace_node_l2" if want_mace else "rmsd"),
-        rmsd_threshold=0.10,
-        mace_node_l2_threshold=2.0,
-        mace_model_path=(str(mace_model_path) if want_mace else None),
-        mace_device=str(mace_device),
-        mace_dtype=str(mace_dtype),
-        binding_tau=1.15,
-        desorption_min_bonds=0,
-        work_dir=out / "basin_work",
-    )
-    basin_out = BasinBuilder(config=cfg).build(
-        frames=pose_frames,
-        slab_ref=slab,
-        adsorbate_ref=ads,
-        slab_n=len(slab),
-        normal_axis=int(ctx.classification.normal_axis),
-    )
-    basins_frames = []
-    for b in basin_out.basins:
-        a = b.atoms.copy()
-        a.info["basin_id"] = int(b.basin_id)
-        a.info["energy_ev"] = float(b.energy_ev)
-        a.info["signature"] = str(b.signature)
-        basins_frames.append(a)
-    if basins_frames:
-        write((out / "basins.extxyz").as_posix(), basins_frames)
-    (out / "basins.json").write_text(
-        json.dumps(
-            {
-                "summary": dict(basin_out.summary),
-                "relax_backend": str(basin_out.relax_backend),
-                "basins": [
-                    {
-                        "basin_id": int(b.basin_id),
-                        "energy_ev": float(b.energy_ev),
-                        "denticity": int(b.denticity),
-                        "signature": str(b.signature),
-                        "member_candidate_ids": [int(x) for x in b.member_candidate_ids],
-                        "binding_pairs": [(int(i), int(j)) for i, j in b.binding_pairs],
-                    }
-                    for b in basin_out.basins
-                ],
-                "rejected": [
-                    {"candidate_id": int(r.candidate_id), "reason": str(r.reason), "metrics": dict(r.metrics)}
-                    for r in basin_out.rejected
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
         ),
-        encoding="utf-8",
-    )
-    energy_min = basin_out.summary.get("energy_min_ev", None)
-    try:
-        energy_min_ev = None if energy_min is None else float(energy_min)
-    except Exception:
-        energy_min_ev = None
-    ncfg = NodeConfig(bond_tau=1.20, node_hash_len=20)
-    nodes = [basin_to_node(b, slab_n=len(slab), cfg=ncfg, energy_min_ev=energy_min_ev) for b in basin_out.basins]
-    (out / "nodes.json").write_text(
-        json.dumps(
-            [
-                {
-                    "node_id": str(n.node_id),
-                    "basin_id": int(n.basin_id),
-                    "canonical_order": [int(x) for x in n.canonical_order],
-                    "atomic_numbers": [int(x) for x in n.atomic_numbers],
-                    "internal_bonds": [(int(i), int(j)) for i, j in n.internal_bonds],
-                    "binding_pairs": [(int(i), int(j)) for i, j in n.binding_pairs],
-                    "denticity": int(n.denticity),
-                    "relative_energy_ev": (None if n.relative_energy_ev is None else float(n.relative_energy_ev)),
-                    "provenance": dict(n.provenance),
-                }
-                for n in nodes
-            ],
-            ensure_ascii=False,
-            indent=2,
+        basin_config=BasinConfig(
+            relax_maxf=0.10,
+            relax_steps=2,
+            energy_window_ev=1.0,
+            dedup_metric=("mace_node_l2" if want_mace else "rmsd"),
+            rmsd_threshold=0.10,
+            mace_node_l2_threshold=2.0,
+            mace_model_path=(str(mace_model_path) if want_mace else None),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            binding_tau=1.15,
+            desorption_min_bonds=0,
+            work_dir=out / "basin_work",
         ),
-        encoding="utf-8",
+        node_config=NodeConfig(bond_tau=1.20, node_hash_len=20),
+        max_primitives=4,
     )
+    result = run_adsorption_workflow(slab=slab, adsorbate=ads, config=cfg)
+    readiness = evaluate_adsorption_workflow_readiness(result)
     return {
         "out_dir": out.as_posix(),
-        "n_primitives": int(len(primitives)),
-        "n_poses": int(len(poses)),
-        "n_basins": int(len(basin_out.basins)),
-        "n_nodes": int(len(nodes)),
+        "n_primitives": int(result.summary["n_primitives"]),
+        "n_poses": int(result.summary["n_pose_frames"]),
+        "n_basins": int(result.summary["n_basins"]),
+        "n_nodes": int(result.summary["n_nodes"]),
         "dedup_metric_requested": ("mace_node_l2" if use_mace_dedup else "rmsd"),
-        "dedup_metric": str(cfg.dedup_metric),
+        "dedup_metric": str(cfg.basin_config.dedup_metric),
+        "paper_readiness_score": int(readiness.score),
+        "paper_readiness_max_score": int(readiness.max_score),
         "files": {
-            "pose_pool": (out / "pose_pool.extxyz").as_posix() if (out / "pose_pool.extxyz").exists() else "",
-            "basins_extxyz": (out / "basins.extxyz").as_posix() if (out / "basins.extxyz").exists() else "",
-            "basins_json": (out / "basins.json").as_posix(),
-            "nodes_json": (out / "nodes.json").as_posix(),
+            "pose_pool": result.artifacts.get("pose_pool_extxyz", ""),
+            "basins_extxyz": result.artifacts.get("basins_extxyz", ""),
+            "basins_json": result.artifacts.get("basins_json", ""),
+            "nodes_json": result.artifacts.get("nodes_json", ""),
+            "site_dictionary_json": result.artifacts.get("site_dictionary_json", ""),
+            "workflow_summary_json": result.artifacts.get("workflow_summary_json", ""),
         },
     }
 
