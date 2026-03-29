@@ -1,0 +1,40 @@
+Metadata-Version: 2.4
+Name: adsorption-ensemble-pipline
+Version: 0.1.0
+Summary: Adsorption ensemble workflow: surface/site detection, pose sampling, basin/node generation, and conformer MD utilities.
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.21
+Requires-Dist: ase>=3.22
+Requires-Dist: scipy>=1.8
+Requires-Dist: matplotlib>=3.6
+
+# Adsorption-ensemble-Pipline
+
+本仓库提供一套端到端的吸附系综工作流与可复用 API，包括：
+- surface 检测与报告导出
+- site primitives 枚举与嵌入
+- pose 采样与筛选
+- basin 去重与异常过滤
+- reaction-ready node 生成（canonicalize + node_id）
+- conformer MD（MD → 特征 → 选择 → relax → 输出）
+
+## 安装（像库一样使用）
+
+在仓库根目录：
+
+```bash
+pip install -e .
+```
+
+安装后任意位置均可：
+
+```python
+import adsorption_ensemble
+```
+
+## 示例
+
+- 全功能说明与命令入口：`examples/FULL_USAGE.md`
+- 端到端可运行脚本示例：`tools/full_repo_example.py`
+
