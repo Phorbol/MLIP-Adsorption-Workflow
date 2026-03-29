@@ -26,6 +26,13 @@ from .visualization.sites import (
     plot_surface_sites_from_groups,
 )
 from .workflows import run_pose_sampling_smoke, validate_pose_sampling_run
+from .workflows import (
+    AdsorptionWorkflowConfig,
+    AdsorptionWorkflowResult,
+    PaperReadinessReport,
+    evaluate_adsorption_workflow_readiness,
+    run_adsorption_workflow,
+)
 from .conformer_md import (
     ConformerEnsemble,
     ConformerMDSampler,
@@ -87,6 +94,11 @@ __all__ = [
     "plot_site_centers_only",
     "plot_inequivalent_sites_2d",
     "plot_site_embedding_pca",
+    "AdsorptionWorkflowConfig",
+    "AdsorptionWorkflowResult",
+    "run_adsorption_workflow",
+    "PaperReadinessReport",
+    "evaluate_adsorption_workflow_readiness",
     "run_pose_sampling_smoke",
     "validate_pose_sampling_run",
     "XTBMDConfig",

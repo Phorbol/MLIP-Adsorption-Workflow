@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+from typing import Any
+
+from ase import Atoms
+from ase.io import write
+
+from adsorption_ensemble.basin import BasinBuilder, BasinConfig, BasinResult
+from adsorption_ensemble.conformer_md import ConformerEnsemble, ConformerMDSampler, ConformerMDSamplerConfig
+from adsorption_ensemble.node import NodeConfig, ReactionNode, basin_to_node
+from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
+from adsorption_ensemble.site import PrimitiveBuilder, build_site_dictionary
+from adsorption_ensemble.surface import SurfaceContext, SurfacePreprocessor, export_surface_detection_report
+
+
+@dataclass
+class AdsorptionWorkflowConfig:
+    work_dir: Path = field(default_factory=lambda: Path("artifacts") / "adsorption_workflow")
+    surface_preprocessor: SurfacePreprocessor = field(default_factory=lambda: SurfacePreprocessor(min_surface_atoms=6))
+    primitive_builder: PrimitiveBuilder = field(default_factory=PrimitiveBuilder)
+    pose_sampler_config: PoseSamplerConfig = field(default_factory=PoseSamplerConfig)
+    basin_config: BasinConfig = field(default_factory=BasinConfig)
+    node_config: NodeConfig = field(default_factory=NodeConfig)
+    run_conformer_search: bool = False
+    conformer_config: ConformerMDSamplerConfig = field(default_factory=ConformerMDSamplerConfig)
+    conformer_job_name: str = "conformer_search"
+    max_primitives: int | None = None
+    save_surface_report: bool = True
+    save_site_dictionary: bool = True
+    save_pose_pool: bool = True
+
+
+@dataclass
+class AdsorptionWorkflowResult:
+    surface_context: SurfaceContext
+    primitives: list[Any]
+    conformers: list[Atoms]
+    pose_frames: list[Atoms]
+    basin_result: BasinResult
+    nodes: list[ReactionNode]
+    artifacts: dict[str, str]
+    summary: dict[str, Any]
+    conformer_result: ConformerEnsemble | None = None
+
+
+def run_adsorption_workflow(
+    slab: Atoms,
+    adsorbate: Atoms,
+    config: AdsorptionWorkflowConfig | None = None,
+    *,
+    md_runner: object | None = None,
+    conformer_descriptor_extractor: object | None = None,
+    conformer_relax_backend: object | None = None,
+    basin_relax_backend: object | None = None,
+) -> AdsorptionWorkflowResult:
+    cfg = config or AdsorptionWorkflowConfig()
+    work_dir = Path(cfg.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = cfg.surface_preprocessor.build_context(slab)
+    surface_report_dir = work_dir / "surface_report"
+    if bool(cfg.save_surface_report):
+        export_surface_detection_report(slab, ctx, surface_report_dir)
+
+    primitives = cfg.primitive_builder.build(slab, ctx)
+    if cfg.max_primitives is not None:
+        primitives = primitives[: max(0, int(cfg.max_primitives))]
+
+    artifacts: dict[str, str] = {}
+    if bool(cfg.save_site_dictionary):
+        site_dictionary = build_site_dictionary(primitives)
+        site_dictionary_path = work_dir / "site_dictionary.json"
+        _write_json(site_dictionary_path, site_dictionary)
+        artifacts["site_dictionary_json"] = site_dictionary_path.as_posix()
+
+    conformer_result: ConformerEnsemble | None = None
+    conformers = [adsorbate.copy()]
+    if bool(cfg.run_conformer_search):
+        conformer_sampler = ConformerMDSampler(
+            config=cfg.conformer_config,
+            md_runner=md_runner,
+            descriptor_extractor=conformer_descriptor_extractor,
+            relax_backend=conformer_relax_backend,
+        )
+        conformer_result = conformer_sampler.run(adsorbate.copy(), job_name=str(cfg.conformer_job_name))
+        conformers = [a.copy() for a in conformer_result.conformers] or [adsorbate.copy()]
+        conformer_meta_path = work_dir / "conformer_metadata.json"
+        _write_json(conformer_meta_path, dict(conformer_result.metadata))
+        artifacts["conformer_metadata_json"] = conformer_meta_path.as_posix()
+
+    pose_sampler = PoseSampler(cfg.pose_sampler_config)
+    pose_frames: list[Atoms] = []
+    for conformer_id, conformer in enumerate(conformers):
+        poses = pose_sampler.sample(
+            slab=slab,
+            adsorbate=conformer,
+            primitives=primitives,
+            surface_atom_ids=ctx.detection.surface_atom_ids,
+        )
+        for pose in poses:
+            frame = slab + pose.atoms
+            frame.info["conformer_id"] = int(conformer_id)
+            frame.info["primitive_index"] = int(pose.primitive_index)
+            frame.info["basis_id"] = (-1 if pose.basis_id is None else int(pose.basis_id))
+            frame.info["rotation_index"] = int(pose.rotation_index)
+            frame.info["azimuth_index"] = int(pose.azimuth_index)
+            frame.info["height_shift_index"] = int(pose.height_shift_index)
+            frame.info["height"] = float(pose.height)
+            pose_frames.append(frame)
+    if bool(cfg.save_pose_pool) and pose_frames:
+        pose_pool_path = work_dir / "pose_pool.extxyz"
+        write(pose_pool_path.as_posix(), pose_frames)
+        artifacts["pose_pool_extxyz"] = pose_pool_path.as_posix()
+
+    basin_cfg = cfg.basin_config
+    basin_cfg.work_dir = work_dir / "basin_work"
+    basin_result = BasinBuilder(config=basin_cfg, relax_backend=basin_relax_backend).build(
+        frames=pose_frames,
+        slab_ref=slab,
+        adsorbate_ref=adsorbate,
+        slab_n=len(slab),
+        normal_axis=int(ctx.classification.normal_axis),
+    )
+
+    basin_frames = []
+    for basin in basin_result.basins:
+        a = basin.atoms.copy()
+        a.info["basin_id"] = int(basin.basin_id)
+        a.info["energy_ev"] = float(basin.energy_ev)
+        a.info["signature"] = str(basin.signature)
+        basin_frames.append(a)
+    if basin_frames:
+        basins_extxyz = work_dir / "basins.extxyz"
+        write(basins_extxyz.as_posix(), basin_frames)
+        artifacts["basins_extxyz"] = basins_extxyz.as_posix()
+    basins_json = work_dir / "basins.json"
+    _write_json(
+        basins_json,
+        {
+            "summary": dict(basin_result.summary),
+            "relax_backend": str(basin_result.relax_backend),
+            "basins": [
+                {
+                    "basin_id": int(b.basin_id),
+                    "energy_ev": float(b.energy_ev),
+                    "denticity": int(b.denticity),
+                    "signature": str(b.signature),
+                    "member_candidate_ids": [int(x) for x in b.member_candidate_ids],
+                    "binding_pairs": [(int(i), int(j)) for i, j in b.binding_pairs],
+                }
+                for b in basin_result.basins
+            ],
+            "rejected": [
+                {"candidate_id": int(r.candidate_id), "reason": str(r.reason), "metrics": dict(r.metrics)}
+                for r in basin_result.rejected
+            ],
+        },
+    )
+    artifacts["basins_json"] = basins_json.as_posix()
+
+    energy_min = basin_result.summary.get("energy_min_ev", None)
+    try:
+        energy_min_ev = None if energy_min is None else float(energy_min)
+    except Exception:
+        energy_min_ev = None
+    nodes = [basin_to_node(b, slab_n=len(slab), cfg=cfg.node_config, energy_min_ev=energy_min_ev) for b in basin_result.basins]
+    nodes_json = work_dir / "nodes.json"
+    _write_json(
+        nodes_json,
+        [
+            {
+                "node_id": str(n.node_id),
+                "basin_id": int(n.basin_id),
+                "canonical_order": [int(x) for x in n.canonical_order],
+                "atomic_numbers": [int(x) for x in n.atomic_numbers],
+                "internal_bonds": [(int(i), int(j)) for i, j in n.internal_bonds],
+                "binding_pairs": [(int(i), int(j)) for i, j in n.binding_pairs],
+                "denticity": int(n.denticity),
+                "relative_energy_ev": (None if n.relative_energy_ev is None else float(n.relative_energy_ev)),
+                "provenance": dict(n.provenance),
+            }
+            for n in nodes
+        ],
+    )
+    artifacts["nodes_json"] = nodes_json.as_posix()
+
+    summary = {
+        "n_surface_atoms": int(len(ctx.detection.surface_atom_ids)),
+        "n_primitives": int(len(primitives)),
+        "n_conformers": int(len(conformers)),
+        "n_pose_frames": int(len(pose_frames)),
+        "n_basins": int(len(basin_result.basins)),
+        "n_nodes": int(len(nodes)),
+        "run_conformer_search": bool(cfg.run_conformer_search),
+    }
+    summary_path = work_dir / "workflow_summary.json"
+    _write_json(summary_path, summary)
+    artifacts["workflow_summary_json"] = summary_path.as_posix()
+    if bool(cfg.save_surface_report):
+        artifacts["surface_report_dir"] = surface_report_dir.as_posix()
+
+    return AdsorptionWorkflowResult(
+        surface_context=ctx,
+        primitives=primitives,
+        conformers=conformers,
+        pose_frames=pose_frames,
+        basin_result=basin_result,
+        nodes=nodes,
+        artifacts=artifacts,
+        summary=summary,
+        conformer_result=conformer_result,
+    )
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
