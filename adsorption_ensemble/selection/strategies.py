@@ -166,6 +166,132 @@ class SiteOccupancyConvergenceCriterion:
 
 
 @dataclass
+class PCAGridOccupancyConvergenceCriterion:
+    features: np.ndarray
+    candidate_ids: list[int] | None = None
+    pca_variance_threshold: float = 0.95
+    grid_bins: int = 12
+    min_rounds: int = 5
+    patience: int = 3
+    min_coverage_gain: float = 1e-3
+    min_novelty: float = 5e-2
+    _pool_ids: np.ndarray = field(init=False, repr=False)
+    _projected_pool: np.ndarray = field(init=False, repr=False)
+    _all_bins: set[tuple[int, ...]] = field(init=False, repr=False)
+    _occupied_bins: set[tuple[int, ...]] = field(default_factory=set, init=False, repr=False)
+    _round_metrics: list[dict] = field(default_factory=list, init=False, repr=False)
+    _stable_rounds: int = field(default=0, init=False, repr=False)
+    _prev_coverage: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        x = np.asarray(self.features, dtype=float)
+        if x.ndim != 2:
+            raise ValueError("features must be a 2D array.")
+        if self.candidate_ids is None:
+            self._pool_ids = np.arange(len(x), dtype=int)
+        else:
+            self._pool_ids = np.asarray([int(i) for i in self.candidate_ids if 0 <= int(i) < len(x)], dtype=int)
+        if len(self._pool_ids) == 0:
+            raise ValueError("candidate_ids produced an empty pool.")
+        self._projected_pool = self._fit_projected_pool(x[self._pool_ids])
+        self._all_bins = {self._point_to_bin(row) for row in self._projected_pool}
+        if not self._all_bins:
+            self._all_bins = {(0,)}
+
+    def reset(self) -> None:
+        self._occupied_bins = set()
+        self._round_metrics = []
+        self._stable_rounds = 0
+        self._prev_coverage = 0.0
+
+    def update(self, newly_selected_ids: list[int], all_selected_ids: list[int], metadata_items: list[dict] | None) -> ConvergenceState:
+        del metadata_items
+        newly_projected = self._project_selected(newly_selected_ids)
+        old_count = len(self._occupied_bins)
+        for row in newly_projected:
+            self._occupied_bins.add(self._point_to_bin(row))
+        new_count = len(self._occupied_bins)
+        coverage = float(new_count) / float(max(1, len(self._all_bins)))
+        coverage_gain = float(coverage - self._prev_coverage)
+        novelty = float(new_count - old_count) / float(max(1, len({self._point_to_bin(row) for row in newly_projected})))
+        if coverage_gain < float(self.min_coverage_gain) and novelty < float(self.min_novelty):
+            self._stable_rounds += 1
+        else:
+            self._stable_rounds = 0
+        round_idx = len(self._round_metrics) + 1
+        stop = bool(round_idx >= int(self.min_rounds) and self._stable_rounds >= int(self.patience))
+        metrics = {
+            "round_index": int(round_idx),
+            "n_new_selected": int(len(newly_selected_ids)),
+            "n_selected_total": int(len(all_selected_ids)),
+            "n_pool_bins": int(len(self._all_bins)),
+            "n_occupied_bins": int(new_count),
+            "coverage": float(coverage),
+            "coverage_gain": float(coverage_gain),
+            "novelty": float(novelty),
+            "stable_rounds": int(self._stable_rounds),
+            "stop": bool(stop),
+        }
+        self._round_metrics.append(metrics)
+        self._prev_coverage = float(coverage)
+        return ConvergenceState(stop=stop, metrics=metrics)
+
+    def summary(self) -> dict:
+        return {
+            "mode": "pca_grid_occupancy",
+            "pca_variance_threshold": float(self.pca_variance_threshold),
+            "grid_bins": int(self.grid_bins),
+            "min_rounds": int(self.min_rounds),
+            "patience": int(self.patience),
+            "min_coverage_gain": float(self.min_coverage_gain),
+            "min_novelty": float(self.min_novelty),
+            "n_pool_bins": int(len(self._all_bins)),
+            "n_occupied_bins": int(len(self._occupied_bins)),
+            "stable_rounds": int(self._stable_rounds),
+            "round_metrics": [dict(x) for x in self._round_metrics],
+        }
+
+    def _fit_projected_pool(self, x: np.ndarray) -> np.ndarray:
+        centered = x - np.mean(x, axis=0, keepdims=True)
+        if centered.shape[1] == 0:
+            return np.zeros((centered.shape[0], 1), dtype=float)
+        _, s, vt = np.linalg.svd(centered, full_matrices=False)
+        var = s * s
+        if np.sum(var) <= 0:
+            return np.zeros((centered.shape[0], 1), dtype=float)
+        ratio = np.cumsum(var) / np.sum(var)
+        n_comp = int(np.searchsorted(ratio, float(self.pca_variance_threshold), side="left") + 1)
+        n_comp = max(1, min(n_comp, vt.shape[0]))
+        comp = vt[:n_comp]
+        projected = centered @ comp.T
+        if projected.shape[1] == 1:
+            return projected
+        return np.asarray(projected, dtype=float)
+
+    def _project_selected(self, selected_ids: list[int]) -> np.ndarray:
+        if not selected_ids:
+            return np.empty((0, self._projected_pool.shape[1]), dtype=float)
+        lookup = {int(idx): int(pos) for pos, idx in enumerate(self._pool_ids.tolist())}
+        rows: list[np.ndarray] = []
+        for idx in selected_ids:
+            pos = lookup.get(int(idx))
+            if pos is not None:
+                rows.append(self._projected_pool[pos])
+        if not rows:
+            return np.empty((0, self._projected_pool.shape[1]), dtype=float)
+        return np.asarray(rows, dtype=float)
+
+    def _point_to_bin(self, row: np.ndarray) -> tuple[int, ...]:
+        row = np.asarray(row, dtype=float).reshape(-1)
+        mins = np.min(self._projected_pool, axis=0)
+        maxs = np.max(self._projected_pool, axis=0)
+        spans = np.maximum(maxs - mins, 1e-12)
+        scaled = (row - mins) / spans
+        edges = np.floor(np.clip(scaled, 0.0, 0.999999) * int(max(1, self.grid_bins))).astype(int)
+        return tuple(int(x) for x in edges.tolist())
+
+
+@dataclass
 class FarthestPointSamplingSelector:
     random_seed: int = 0
 

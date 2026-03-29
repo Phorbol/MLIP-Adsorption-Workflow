@@ -130,6 +130,29 @@ class TestConformerMDPipeline(unittest.TestCase):
             self.assertTrue((Path(td) / "ut_fps" / "stage_metrics.json").exists())
             self.assertTrue((Path(td) / "ut_fps" / "stage_metrics.csv").exists())
 
+    def test_pipeline_end_to_end_fps_with_grid_convergence(self):
+        cfg = ConformerMDSamplerConfig()
+        cfg.selection.preselect_k = 8
+        cfg.selection.mode = "fps"
+        cfg.selection.fps_round_size = 2
+        cfg.selection.fps_rounds = 10
+        cfg.selection.fps_convergence_enable = True
+        cfg.selection.fps_convergence_grid_bins = 2
+        cfg.selection.fps_convergence_min_rounds = 2
+        cfg.selection.fps_convergence_patience = 1
+        cfg.selection.fps_convergence_min_coverage_gain = 1e-6
+        cfg.selection.fps_convergence_min_novelty = 0.25
+        with TemporaryDirectory() as td:
+            cfg.output.work_dir = Path(td)
+            sampler = ConformerMDSampler(
+                config=cfg,
+                md_runner=FakeMDRunner(),
+                relax_backend=FakeRelaxBackend(),
+            )
+            result = sampler.run(molecule("H2O"), job_name="ut_fps_grid")
+            self.assertGreater(len(result.conformers), 0)
+            self.assertTrue((Path(td) / "ut_fps_grid" / "summary.json").exists())
+
     def test_pipeline_end_to_end_kmeans(self):
         cfg = ConformerMDSamplerConfig()
         cfg.selection.preselect_k = 6

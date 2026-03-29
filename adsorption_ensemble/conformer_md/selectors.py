@@ -4,7 +4,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from adsorption_ensemble.selection import DualThresholdSelector, EnergyWindowFilter, FarthestPointSamplingSelector, RMSDSelector
+from adsorption_ensemble.selection import (
+    DualThresholdSelector,
+    EnergyWindowFilter,
+    FarthestPointSamplingSelector,
+    PCAGridOccupancyConvergenceCriterion,
+    RMSDSelector,
+)
 
 from .config import SelectionConfig
 
@@ -40,12 +46,24 @@ class ConformerSelector:
         k = max(1, min(self.config.preselect_k, len(features)))
         mode = self.config.mode.lower()
         if mode == "fps":
+            convergence = None
+            if bool(self.config.fps_convergence_enable):
+                convergence = PCAGridOccupancyConvergenceCriterion(
+                    features=np.asarray(features, dtype=float),
+                    pca_variance_threshold=float(self.config.fps_convergence_pca_var),
+                    grid_bins=int(self.config.fps_convergence_grid_bins),
+                    min_rounds=int(self.config.fps_convergence_min_rounds),
+                    patience=int(self.config.fps_convergence_patience),
+                    min_coverage_gain=float(self.config.fps_convergence_min_coverage_gain),
+                    min_novelty=float(self.config.fps_convergence_min_novelty),
+                )
             result = self._fps.select_iterative(
                 features=features,
                 k=k,
                 seed_ids=list(self.config.fps_seed_indices),
                 round_size=self.config.fps_round_size,
                 rounds=self.config.fps_rounds,
+                convergence=convergence,
             )
             return result.selected_ids
         if mode == "fps_pca_kmeans":

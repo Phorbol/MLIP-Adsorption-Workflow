@@ -4,7 +4,11 @@ from pathlib import Path
 
 import numpy as np
 
-from adsorption_ensemble.selection import FarthestPointSamplingSelector, SiteOccupancyConvergenceCriterion
+from adsorption_ensemble.selection import (
+    FarthestPointSamplingSelector,
+    PCAGridOccupancyConvergenceCriterion,
+    SiteOccupancyConvergenceCriterion,
+)
 
 
 def _normalize_seed_indices(seed_indices: tuple[int, ...] | list[int] | None) -> list[int]:
@@ -34,11 +38,28 @@ def run_iterative_pose_fps_preselection(
     occupancy_min_new_bins: int = 0,
     occupancy_patience: int = 2,
     occupancy_min_rounds: int = 1,
+    grid_convergence: bool = False,
+    grid_convergence_pca_var: float = 0.95,
+    grid_convergence_grid_bins: int = 12,
+    grid_convergence_min_rounds: int = 5,
+    grid_convergence_patience: int = 3,
+    grid_convergence_min_coverage_gain: float = 1e-3,
+    grid_convergence_min_novelty: float = 5e-2,
 ) -> dict:
     fps = FarthestPointSamplingSelector(random_seed=int(random_seed))
     metadata_items = [dict(getattr(a, "info", {}) or {}) for a in pooled]
     convergence = None
-    if occupancy_convergence:
+    if grid_convergence:
+        convergence = PCAGridOccupancyConvergenceCriterion(
+            features=np.asarray(features, dtype=float),
+            pca_variance_threshold=float(grid_convergence_pca_var),
+            grid_bins=int(grid_convergence_grid_bins),
+            min_rounds=int(grid_convergence_min_rounds),
+            patience=int(grid_convergence_patience),
+            min_coverage_gain=float(grid_convergence_min_coverage_gain),
+            min_novelty=float(grid_convergence_min_novelty),
+        )
+    elif occupancy_convergence:
         convergence = SiteOccupancyConvergenceCriterion(
             min_new_bins=int(occupancy_min_new_bins),
             patience=int(occupancy_patience),

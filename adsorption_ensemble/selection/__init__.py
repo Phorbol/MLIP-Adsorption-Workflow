@@ -4,6 +4,7 @@ from .strategies import (
     EnergyWindowFilter,
     FarthestPointSamplingSelector,
     IterativeFPSResult,
+    PCAGridOccupancyConvergenceCriterion,
     RMSDSelector,
     SiteOccupancyConvergenceCriterion,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "RMSDSelector",
     "FarthestPointSamplingSelector",
     "IterativeFPSResult",
+    "PCAGridOccupancyConvergenceCriterion",
     "SiteOccupancyConvergenceCriterion",
     "DualThresholdSelector",
 ]

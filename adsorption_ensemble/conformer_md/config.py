@@ -36,6 +36,13 @@ class SelectionConfig:
     fps_seed_indices: tuple[int, ...] = ()
     fps_round_size: int | None = None
     fps_rounds: int | None = None
+    fps_convergence_enable: bool = False
+    fps_convergence_pca_var: float = 0.95
+    fps_convergence_grid_bins: int = 12
+    fps_convergence_min_rounds: int = 5
+    fps_convergence_patience: int = 3
+    fps_convergence_min_coverage_gain: float = 1e-3
+    fps_convergence_min_novelty: float = 5e-2
 
 
 @dataclass
