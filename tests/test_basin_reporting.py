@@ -43,6 +43,11 @@ class TestBasinReporting(unittest.TestCase):
             result = run_adsorption_workflow(slab=slab, adsorbate=ads, config=cfg)
             self.assertTrue((Path(td) / "basin_dictionary.json").exists())
             self.assertTrue((Path(td) / "basin_ablation.json").exists())
+            self.assertTrue((Path(td) / "raw_site_dictionary.json").exists())
+            self.assertTrue((Path(td) / "selected_site_dictionary.json").exists())
+            self.assertTrue((Path(td) / "sites.png").exists())
+            self.assertTrue((Path(td) / "sites_only.png").exists())
+            self.assertTrue((Path(td) / "sites_inequivalent.png").exists())
             self.assertIn("basin_dictionary_json", result.artifacts)
             self.assertIn("basin_ablation_json", result.artifacts)
 

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from ase import Atoms
 from ase.io import write
 
@@ -12,8 +13,14 @@ from adsorption_ensemble.basin import BasinBuilder, BasinConfig, BasinResult, bu
 from adsorption_ensemble.conformer_md import ConformerEnsemble, ConformerMDSampler, ConformerMDSamplerConfig
 from adsorption_ensemble.node import NodeConfig, ReactionNode, basin_to_node
 from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
-from adsorption_ensemble.site import PrimitiveBuilder, build_site_dictionary
+from adsorption_ensemble.site import PrimitiveBuilder, PrimitiveEmbedder, PrimitiveEmbeddingConfig, build_site_dictionary
 from adsorption_ensemble.surface import SurfaceContext, SurfacePreprocessor, export_surface_detection_report
+from adsorption_ensemble.visualization import (
+    plot_inequivalent_sites_2d,
+    plot_site_centers_only,
+    plot_site_embedding_pca,
+    plot_surface_primitives_2d,
+)
 
 
 @dataclass
@@ -28,12 +35,17 @@ class AdsorptionWorkflowConfig:
     conformer_config: ConformerMDSamplerConfig = field(default_factory=ConformerMDSamplerConfig)
     conformer_job_name: str = "conformer_search"
     max_primitives: int | None = None
+    max_selected_primitives: int | None = None
     save_surface_report: bool = True
     save_site_dictionary: bool = True
     save_pose_pool: bool = True
     save_basin_dictionary: bool = True
     save_basin_ablation: bool = False
     basin_ablation_metrics: tuple[str, ...] = ("signature_only", "rmsd")
+    save_site_visualizations: bool = True
+    save_raw_site_dictionary: bool = True
+    save_selected_site_dictionary: bool = True
+    primitive_embedding_config: PrimitiveEmbeddingConfig = field(default_factory=PrimitiveEmbeddingConfig)
 
 
 @dataclass
@@ -68,16 +80,44 @@ def run_adsorption_workflow(
     if bool(cfg.save_surface_report):
         export_surface_detection_report(slab, ctx, surface_report_dir)
 
-    primitives = cfg.primitive_builder.build(slab, ctx)
+    raw_primitives = cfg.primitive_builder.build(slab, ctx)
     if cfg.max_primitives is not None:
-        primitives = primitives[: max(0, int(cfg.max_primitives))]
+        raw_primitives = raw_primitives[: max(0, int(cfg.max_primitives))]
+    primitives = list(raw_primitives)
+    atom_features = _make_atomic_number_features(slab)
+    embed_result = PrimitiveEmbedder(cfg.primitive_embedding_config).fit_transform(slab=slab, primitives=primitives, atom_features=atom_features)
+    primitives = list(embed_result.primitives)
+    if cfg.max_selected_primitives is not None:
+        primitives = primitives[: max(0, int(cfg.max_selected_primitives))]
 
     artifacts: dict[str, str] = {}
-    if bool(cfg.save_site_dictionary):
-        site_dictionary = build_site_dictionary(primitives)
-        site_dictionary_path = work_dir / "site_dictionary.json"
-        _write_json(site_dictionary_path, site_dictionary)
-        artifacts["site_dictionary_json"] = site_dictionary_path.as_posix()
+    if bool(cfg.save_raw_site_dictionary):
+        raw_site_dictionary = build_site_dictionary(embed_result.primitives)
+        raw_site_dictionary_path = work_dir / "raw_site_dictionary.json"
+        _write_json(raw_site_dictionary_path, raw_site_dictionary)
+        artifacts["raw_site_dictionary_json"] = raw_site_dictionary_path.as_posix()
+    if bool(cfg.save_selected_site_dictionary):
+        selected_site_dictionary = build_site_dictionary(primitives)
+        selected_site_dictionary_path = work_dir / "selected_site_dictionary.json"
+        _write_json(selected_site_dictionary_path, selected_site_dictionary)
+        artifacts["selected_site_dictionary_json"] = selected_site_dictionary_path.as_posix()
+        if bool(cfg.save_site_dictionary):
+            site_dictionary_path = work_dir / "site_dictionary.json"
+            _write_json(site_dictionary_path, selected_site_dictionary)
+            artifacts["site_dictionary_json"] = site_dictionary_path.as_posix()
+    if bool(cfg.save_site_visualizations):
+        sites_png = work_dir / "sites.png"
+        sites_only_png = work_dir / "sites_only.png"
+        sites_ineq_png = work_dir / "sites_inequivalent.png"
+        plot_surface_primitives_2d(slab=slab, context=ctx, primitives=embed_result.primitives, filename=sites_png)
+        plot_site_centers_only(slab=slab, primitives=embed_result.primitives, filename=sites_only_png)
+        plot_inequivalent_sites_2d(slab=slab, primitives=embed_result.primitives, filename=sites_ineq_png)
+        artifacts["sites_png"] = sites_png.as_posix()
+        artifacts["sites_only_png"] = sites_only_png.as_posix()
+        artifacts["sites_inequivalent_png"] = sites_ineq_png.as_posix()
+        site_pca_png = work_dir / "site_embedding_pca.png"
+        plot_site_embedding_pca(embed_result.primitives, filename=site_pca_png)
+        artifacts["site_embedding_pca_png"] = site_pca_png.as_posix()
 
     conformer_result: ConformerEnsemble | None = None
     conformers = [adsorbate.copy()]
@@ -219,6 +259,8 @@ def run_adsorption_workflow(
     summary = {
         "n_surface_atoms": int(len(ctx.detection.surface_atom_ids)),
         "n_primitives": int(len(primitives)),
+        "n_raw_primitives": int(len(embed_result.primitives)),
+        "n_basis_primitives": int(len(embed_result.basis_primitives)),
         "n_conformers": int(len(conformers)),
         "n_pose_frames": int(len(pose_frames)),
         "n_basins": int(len(basin_result.basins)),
@@ -286,3 +328,9 @@ def _adsorbate_span(adsorbate: Atoms) -> float:
         return 0.0
     pos = adsorbate.get_positions()
     return float(max(pos.max(axis=0) - pos.min(axis=0)))
+
+
+def _make_atomic_number_features(slab: Atoms) -> Any:
+    z = slab.get_atomic_numbers().astype(float)
+    z = z / (np.max(z) + 1e-12)
+    return z.reshape(-1, 1)

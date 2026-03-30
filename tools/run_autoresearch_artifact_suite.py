@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adsorption_ensemble.basin import BasinConfig
 from adsorption_ensemble.pose import PoseSamplerConfig
+from adsorption_ensemble.site import PrimitiveEmbeddingConfig
+from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
 from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, evaluate_adsorption_workflow_readiness, run_adsorption_workflow
 from tests.chemistry_cases import get_test_adsorbate_cases
 
@@ -45,15 +47,22 @@ def default_cases():
 def build_config(work_dir: Path) -> AdsorptionWorkflowConfig:
     return AdsorptionWorkflowConfig(
         work_dir=work_dir,
+        surface_preprocessor=SurfacePreprocessor(
+            min_surface_atoms=6,
+            primary_detector=ProbeScanDetector(grid_step=0.6),
+            fallback_detector=VoxelFloodDetector(spacing=0.8),
+            target_surface_fraction=None,
+            target_count_mode="off",
+        ),
         pose_sampler_config=PoseSamplerConfig(
-            n_rotations=1,
-            n_azimuth=3,
-            n_shifts=1,
-            shift_radius=0.0,
+            n_rotations=4,
+            n_azimuth=8,
+            n_shifts=2,
+            shift_radius=0.2,
             min_height=1.5,
-            max_height=2.5,
-            height_step=0.25,
-            max_poses_per_site=1,
+            max_height=3.0,
+            height_step=0.2,
+            max_poses_per_site=4,
             random_seed=0,
         ),
         basin_config=BasinConfig(
@@ -63,10 +72,15 @@ def build_config(work_dir: Path) -> AdsorptionWorkflowConfig:
             desorption_min_bonds=0,
             work_dir=None,
         ),
-        max_primitives=2,
+        max_primitives=None,
+        max_selected_primitives=24,
         save_basin_dictionary=True,
         save_basin_ablation=True,
         basin_ablation_metrics=("signature_only", "rmsd"),
+        save_site_visualizations=True,
+        save_raw_site_dictionary=True,
+        save_selected_site_dictionary=True,
+        primitive_embedding_config=PrimitiveEmbeddingConfig(l2_distance_threshold=0.22),
     )
 
 
@@ -115,3 +129,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+from adsorption_ensemble.site import PrimitiveEmbeddingConfig
+from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
