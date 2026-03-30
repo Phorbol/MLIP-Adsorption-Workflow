@@ -5,6 +5,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 from ase.build import bcc110, bulk, fcc100, fcc111, fcc211, surface
@@ -13,10 +14,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adsorption_ensemble.basin import BasinConfig
 from adsorption_ensemble.pose import PoseSamplerConfig
+from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.site import PrimitiveEmbeddingConfig
 from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
 from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, evaluate_adsorption_workflow_readiness, run_adsorption_workflow
 from tests.chemistry_cases import get_test_adsorbate_cases
+
+
+DEFAULT_MACE_MODEL_CANDIDATES = (
+    "/root/.cache/mace/mace-omat-0-small.model",
+    "/root/.cache/mace/mace-mh-1.model",
+    "/root/.cache/mace/MACE-OFF23_small.model",
+    "/root/.cache/mace/MACE-OFF24_medium.model",
+)
 
 
 def build_slab_cases():
@@ -72,7 +82,14 @@ def real_cases():
     ]
 
 
-def build_config(work_dir: Path, *, mace_model_path: str | None, max_selected_primitives: int) -> AdsorptionWorkflowConfig:
+def build_config(
+    work_dir: Path,
+    *,
+    mace_model_path: str | None,
+    mace_device: str,
+    mace_dtype: str,
+    max_selected_primitives: int,
+) -> AdsorptionWorkflowConfig:
     return AdsorptionWorkflowConfig(
         work_dir=work_dir,
         surface_preprocessor=SurfacePreprocessor(
@@ -95,13 +112,15 @@ def build_config(work_dir: Path, *, mace_model_path: str | None, max_selected_pr
         ),
         basin_config=BasinConfig(
             relax_maxf=0.1,
-            relax_steps=1,
+            relax_steps=80,
             energy_window_ev=2.0,
+            dedup_metric="mace_node_l2",
+            mace_node_l2_threshold=2.0,
             desorption_min_bonds=0,
             work_dir=None,
             mace_model_path=mace_model_path,
-            mace_device="cpu",
-            mace_dtype="float32",
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
             mace_max_edges_per_batch=15000,
             mace_layers_to_keep=-1,
         ),
@@ -117,6 +136,17 @@ def build_config(work_dir: Path, *, mace_model_path: str | None, max_selected_pr
     )
 
 
+def infer_mace_head_name(model_path: str | None) -> str | None:
+    if not model_path:
+        return None
+    name = Path(model_path).name.lower()
+    if "omat" in name:
+        return "omat_pbe"
+    if "omol" in name:
+        return "omol"
+    return None
+
+
 def run_cases(
     *,
     out_root: Path,
@@ -124,16 +154,36 @@ def run_cases(
     slabs: dict,
     adsorbates: dict,
     mace_model_path: str | None,
+    mace_device: str,
+    mace_dtype: str,
     max_selected_primitives: int,
 ) -> list[dict]:
     rows = []
+    head_name = infer_mace_head_name(mace_model_path)
+    relax_backend = MACEBatchRelaxBackend(
+        MaceRelaxConfig(
+            model_path=mace_model_path,
+            device=str(mace_device),
+            dtype=str(mace_dtype),
+            max_edges_per_batch=15000,
+            head_name=head_name,
+            strict=True,
+        )
+    )
     for slab_name, ads_name in cases:
         case_dir = out_root / slab_name / ads_name
-        cfg = build_config(case_dir, mace_model_path=mace_model_path, max_selected_primitives=max_selected_primitives)
+        cfg = build_config(
+            case_dir,
+            mace_model_path=mace_model_path,
+            mace_device=mace_device,
+            mace_dtype=mace_dtype,
+            max_selected_primitives=max_selected_primitives,
+        )
         result = run_adsorption_workflow(
             slab=slabs[slab_name],
             adsorbate=adsorbates[ads_name],
             config=cfg,
+            basin_relax_backend=relax_backend,
         )
         readiness = evaluate_adsorption_workflow_readiness(result)
         row = {
@@ -166,19 +216,94 @@ def write_rows(rows: list[dict], *, out_json: Path, out_csv: Path) -> None:
         writer.writerows(rows)
 
 
+def resolve_mace_model_path(cli_value: str) -> tuple[str | None, str]:
+    val = str(cli_value).strip()
+    if val:
+        p = Path(val)
+        return (str(p) if p.exists() else None), "cli"
+    env_val = str(os.environ.get("AE_MACE_MODEL_PATH", "")).strip()
+    if env_val:
+        p = Path(env_val)
+        return (str(p) if p.exists() else None), "env"
+    for cand in DEFAULT_MACE_MODEL_CANDIDATES:
+        p = Path(cand)
+        if p.exists():
+            return str(p), "auto"
+    return None, "none"
+
+
+def runtime_manifest(
+    *,
+    mace_model_path: str | None,
+    model_source: str,
+    mace_device: str,
+    mace_device_effective: str,
+    mace_dtype: str,
+    out_root: Path,
+) -> dict:
+    py = shutil.which("python")
+    payload = {
+        "cwd": Path.cwd().as_posix(),
+        "python_executable": py,
+        "mace_model_path": mace_model_path,
+        "mace_model_source": model_source,
+        "mace_device_requested": str(mace_device),
+        "mace_device_effective": str(mace_device_effective),
+        "mace_dtype": str(mace_dtype),
+        "ae_disable_mace": str(os.environ.get("AE_DISABLE_MACE", "")),
+    }
+    try:
+        import torch  # type: ignore
+
+        payload["torch_version"] = str(torch.__version__)
+        payload["torch_cuda_available"] = bool(torch.cuda.is_available())
+    except Exception as exc:
+        payload["torch_import_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        import mace  # type: ignore
+
+        payload["mace_version"] = str(getattr(mace, "__version__", "unknown"))
+    except Exception as exc:
+        payload["mace_import_error"] = f"{type(exc).__name__}: {exc}"
+    out_path = out_root / "runtime_manifest.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-root", type=str, default="artifacts/autoresearch")
     parser.add_argument("--mace-model-path", type=str, default="")
+    parser.add_argument("--mace-device", type=str, default="cuda")
+    parser.add_argument("--require-cuda", action="store_true", default=True)
+    parser.add_argument("--mace-dtype", type=str, default="float32")
     parser.add_argument("--max-selected-primitives", type=int, default=24)
     args = parser.parse_args()
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    mace_model_path = str(args.mace_model_path).strip()
-    if not mace_model_path:
-        mace_model_path = str(os.environ.get("AE_MACE_MODEL_PATH", "")).strip()
-    mace_model_path = mace_model_path if mace_model_path else None
+    device_requested = str(args.mace_device)
+    device_effective = str(device_requested)
+    if str(device_requested).lower().startswith("cuda"):
+        ok = False
+        try:
+            import torch  # type: ignore
+
+            ok = bool(torch.cuda.is_available())
+        except Exception:
+            ok = False
+        if not ok and bool(args.require_cuda):
+            raise RuntimeError("CUDA is required for MACE, but torch.cuda.is_available() is False.")
+
+    mace_model_path, model_source = resolve_mace_model_path(args.mace_model_path)
+    runtime_info = runtime_manifest(
+        mace_model_path=mace_model_path,
+        model_source=model_source,
+        mace_device=device_requested,
+        mace_device_effective=device_effective,
+        mace_dtype=str(args.mace_dtype),
+        out_root=out_root,
+    )
 
     slabs = build_slab_cases()
     adsorbates = get_test_adsorbate_cases()
@@ -191,6 +316,8 @@ def main() -> int:
         slabs=slabs,
         adsorbates=adsorbates,
         mace_model_path=mace_model_path,
+        mace_device=device_effective,
+        mace_dtype=str(args.mace_dtype),
         max_selected_primitives=int(args.max_selected_primitives),
     )
     real_rows = run_cases(
@@ -199,6 +326,8 @@ def main() -> int:
         slabs=slabs,
         adsorbates=adsorbates,
         mace_model_path=mace_model_path,
+        mace_device=device_effective,
+        mace_dtype=str(args.mace_dtype),
         max_selected_primitives=int(args.max_selected_primitives),
     )
 
@@ -217,6 +346,12 @@ def main() -> int:
         "n_workflow_matrix_cases": len(matrix_rows),
         "n_real_cases": len(real_rows),
         "mace_model_path": mace_model_path,
+        "mace_model_source": model_source,
+        "mace_device_requested": device_requested,
+        "mace_device_effective": device_effective,
+        "mace_dtype": str(args.mace_dtype),
+        "runtime_manifest_json": (out_root / "runtime_manifest.json").as_posix(),
+        "torch_cuda_available": runtime_info.get("torch_cuda_available"),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0

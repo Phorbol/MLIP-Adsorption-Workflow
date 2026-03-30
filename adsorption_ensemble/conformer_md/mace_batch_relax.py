@@ -232,7 +232,9 @@ class RelaxBatch:
                     stress_i * self.calc.energy_units_to_eV / self.calc.length_units_to_A**3
                 )
             target_atoms.calc = SinglePointCalculator(target_atoms, energy=e, forces=f, stress=s)
-            current_f = opt.atoms.get_forces().flatten()
+            # ASE Optimizer.converged expects per-atom force shape (N, 3),
+            # not a flattened 1D vector.
+            current_f = opt.atoms.get_forces()
             step_count = getattr(opt, "nsteps", 0)
             if opt.converged(current_f) or (step_count >= self.max_n_steps):
                 self.opt_flags[i] = False

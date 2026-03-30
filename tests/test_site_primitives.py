@@ -1,3 +1,4 @@
+import os
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -194,10 +195,37 @@ class TestSitePrimitives(unittest.TestCase):
 
     def test_classic_slab_gate_fixed_config_with_mace_features(self):
         try:
-            from mace.calculators import mace_mp
+            from mace.calculators import MACECalculator
         except Exception as exc:
             self.skipTest(f"mace unavailable: {exc}")
-        calc = mace_mp(model="small", device="cpu", default_dtype="float64")
+        model_path = None
+        env_model = str(os.environ.get("AE_MACE_MODEL_PATH", "")).strip()
+        if env_model and Path(env_model).exists():
+            model_path = env_model
+        else:
+            for cand in (
+                "/root/.cache/mace/mace-omat-0-small.model",
+                "/root/.cache/mace/mace-mh-1.model",
+                "/root/.cache/mace/MACE-OFF23_small.model",
+            ):
+                if Path(cand).exists():
+                    model_path = cand
+                    break
+        if model_path is None:
+            self.skipTest("No local MACE model available for offline test.")
+        try:
+            calc = MACECalculator(model_paths=[model_path], device="cpu", default_dtype="float64")
+        except ValueError as exc:
+            msg = str(exc)
+            if "Available heads are:" not in msg:
+                raise
+            head_raw = msg.split("Available heads are:", 1)[-1].strip()
+            head_raw = head_raw.strip("[]")
+            heads = [x.strip().strip("'").strip('"') for x in head_raw.split(",") if x.strip()]
+            if not heads:
+                raise
+            head = "omat_pbe" if "omat_pbe" in heads else heads[0]
+            calc = MACECalculator(model_paths=[model_path], device="cpu", default_dtype="float64", head=head)
         pre = SurfacePreprocessor(
             min_surface_atoms=6,
             primary_detector=ProbeScanDetector(grid_step=0.6),
