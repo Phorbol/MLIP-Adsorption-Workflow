@@ -86,8 +86,10 @@ class TestBasinReporting(unittest.TestCase):
                 slab_n=len(slab),
                 normal_axis=int(result.surface_context.classification.normal_axis),
                 base_config=cfg.basin_config,
-                metrics=("signature_only", "rmsd"),
+                metrics=("signature_only", "rmsd", "mace_node_l2"),
             )
             self.assertIn("metrics", ablation)
             self.assertIn("signature_only", ablation["metrics"])
             self.assertIn("rmsd", ablation["metrics"])
+            self.assertIn("mace_node_l2", ablation["metrics"])
+            self.assertIn(ablation["metrics"]["mace_node_l2"]["status"], {"ok", "error"})

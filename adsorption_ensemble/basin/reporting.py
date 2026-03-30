@@ -97,20 +97,32 @@ def run_basin_ablation(
     out: dict[str, Any] = {"metrics": {}}
     for metric in metrics:
         cfg = replace(base_config, dedup_metric=str(metric))
-        result = BasinBuilder(config=cfg, relax_backend=relax_backend).build(
-            frames=frames,
-            slab_ref=slab_ref,
-            adsorbate_ref=adsorbate_ref,
-            slab_n=int(slab_n),
-            normal_axis=int(normal_axis),
-        )
-        out["metrics"][str(metric)] = {
-            "summary": dict(result.summary),
-            "n_basins": int(len(result.basins)),
-            "n_rejected": int(len(result.rejected)),
-            "basin_sizes": [int(len(b.member_candidate_ids)) for b in result.basins],
-            "basin_signatures": [str(b.signature) for b in result.basins],
-        }
+        try:
+            result = BasinBuilder(config=cfg, relax_backend=relax_backend).build(
+                frames=frames,
+                slab_ref=slab_ref,
+                adsorbate_ref=adsorbate_ref,
+                slab_n=int(slab_n),
+                normal_axis=int(normal_axis),
+            )
+            out["metrics"][str(metric)] = {
+                "status": "ok",
+                "summary": dict(result.summary),
+                "n_basins": int(len(result.basins)),
+                "n_rejected": int(len(result.rejected)),
+                "basin_sizes": [int(len(b.member_candidate_ids)) for b in result.basins],
+                "basin_signatures": [str(b.signature) for b in result.basins],
+            }
+        except Exception as exc:
+            out["metrics"][str(metric)] = {
+                "status": "error",
+                "error_type": str(type(exc).__name__),
+                "error_message": str(exc),
+                "n_basins": 0,
+                "n_rejected": 0,
+                "basin_sizes": [],
+                "basin_signatures": [],
+            }
     counts = {k: int(v["n_basins"]) for k, v in out["metrics"].items()}
     if counts:
         min_metric = min(counts, key=counts.get)
