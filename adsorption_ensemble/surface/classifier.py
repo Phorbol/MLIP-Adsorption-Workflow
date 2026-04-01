@@ -31,13 +31,31 @@ class SlabClassifier:
 
     def _classify_with_isolation(self, atoms: Atoms) -> Optional[SlabClassificationResult]:
         try:
-            from ase.geometry.dimensionality.isolation import isolate_components
+            from ase.geometry.dimensionality import analyze_dimensionality
         except Exception:
             return None
         try:
-            _ = isolate_components(atoms)
+            intervals = analyze_dimensionality(atoms, method="RDA", merge=True)
         except Exception:
             return None
+        if not intervals:
+            return None
+        best = intervals[0]
+        dimtype = str(getattr(best, "dimtype", ""))
+        score = float(getattr(best, "score", 0.0))
+        cell_lengths = atoms.cell.lengths()
+        wrapped = atoms.get_scaled_positions(wrap=True)
+        span_frac = wrapped.max(axis=0) - wrapped.min(axis=0)
+        span_frac = np.clip(span_frac, 0.0, 1.0)
+        atomic_span = span_frac * cell_lengths
+        vacuum = np.clip(cell_lengths - atomic_span, 0.0, None)
+        axis = int(np.argmax(vacuum))
+        if "2D" in dimtype and score >= 0.50:
+            confidence = float(max(0.0, min(1.0, score)))
+            return SlabClassificationResult(True, axis, tuple(float(x) for x in vacuum), confidence, "isolation_rda")
+        if "3D" in dimtype and score >= 0.50:
+            confidence = float(max(0.0, min(1.0, score)))
+            return SlabClassificationResult(False, None, tuple(float(x) for x in vacuum), confidence, "isolation_rda")
         return None
 
     def _classify_with_vacuum_heuristic(self, atoms: Atoms) -> SlabClassificationResult:

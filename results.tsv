@@ -1,0 +1,4 @@
+experiment	commit	metric	status	description
+0	6e02693	84.721295	baseline	gpu benchmark e0: batch_relax+mace_l2 fast profile
+1	ae5de1e	82.551312	discard	allow dissociation bond change
+2	1479e46	2.000000	keep	ase/autoadsorbate cross-matrix remaining failures after hard-surface fallback

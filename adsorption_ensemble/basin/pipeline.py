@@ -104,6 +104,9 @@ class BasinBuilder:
                 slab_n=int(slab_n),
                 binding_tau=float(cfg.binding_tau),
                 rmsd_threshold=float(cfg.rmsd_threshold),
+                cluster_method=str(cfg.dedup_cluster_method),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
             )
         dedup_meta: dict = {}
         if dedup_metric in {"mace", "mace_node_l2", "mace_l2"}:
@@ -120,6 +123,10 @@ class BasinBuilder:
                 mace_layers_to_keep=int(cfg.mace_layers_to_keep),
                 mace_head_name=cfg.mace_head_name,
                 mace_mlp_energy_key=cfg.mace_mlp_energy_key,
+                cluster_method=str(cfg.dedup_cluster_method),
+                l2_mode=str(cfg.mace_node_l2_mode),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
             )
         basins: list[Basin] = []
         for b in basins_raw:
@@ -145,6 +152,7 @@ class BasinBuilder:
             "n_basins": int(len(basins)),
             "energy_min_ev": None if not np.isfinite(e0) else float(e0),
             "dedup_metric": str(cfg.dedup_metric),
+            "dedup_cluster_method": str(cfg.dedup_cluster_method),
             "dedup_meta": dict(dedup_meta),
         }
         return BasinResult(basins=basins, rejected=rejected, relax_backend=str(relax_backend_name), summary=summary)

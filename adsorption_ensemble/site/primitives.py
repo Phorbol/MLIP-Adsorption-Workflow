@@ -5,6 +5,7 @@ from itertools import combinations
 
 import numpy as np
 from ase import Atom, Atoms
+from ase.build import add_adsorbate
 
 from adsorption_ensemble.surface.graph import ExposedSurfaceGraph
 from adsorption_ensemble.surface.pipeline import SurfaceContext
@@ -152,6 +153,7 @@ class PrimitiveBuilder:
         min_polygon_area: float = 0.05,
         min_center_surface_distance: float = 0.20,
         center_surface_distance_factor: float = 0.35,
+        use_ase_reference_sites: bool = True,
     ):
         self.enumerator = enumerator or PrimitiveEnumerator()
         self.frame_builder = frame_builder or LocalFrameBuilder()
@@ -159,6 +161,7 @@ class PrimitiveBuilder:
         self.min_polygon_area = min_polygon_area
         self.min_center_surface_distance = min_center_surface_distance
         self.center_surface_distance_factor = center_surface_distance_factor
+        self.use_ase_reference_sites = use_ase_reference_sites
 
     def build(self, slab: Atoms, context: SurfaceContext) -> list[SitePrimitive]:
         normal_axis = context.classification.normal_axis
@@ -189,7 +192,113 @@ class PrimitiveBuilder:
             context.classification.normal_axis,
             context.detection.surface_atom_ids,
         )
-        return self._prune_by_center_distance(primitives, slab)
+        primitives = self._prune_by_center_distance(primitives, slab)
+        if self.use_ase_reference_sites:
+            ref = self._build_from_ase_reference_sites(
+                slab=slab,
+                normal_axis=int(context.classification.normal_axis),
+                surface_ids=list(context.detection.surface_atom_ids),
+                graph=context.graph,
+            )
+            if ref is not None and len(ref) > 0:
+                return ref
+        return primitives
+
+    def _build_from_ase_reference_sites(
+        self,
+        slab: Atoms,
+        normal_axis: int,
+        surface_ids: list[int],
+        graph: ExposedSurfaceGraph,
+    ) -> list[SitePrimitive] | None:
+        info = slab.info.get("adsorbate_info", {})
+        if not isinstance(info, dict):
+            return None
+        sites = info.get("sites", {})
+        if not isinstance(sites, dict) or not sites:
+            return None
+        global_normal = np.zeros(3, dtype=float)
+        global_normal[int(normal_axis)] = 1.0
+        out: list[SitePrimitive] = []
+        for name in sorted(str(k) for k in sites.keys()):
+            center = self._ase_site_center(slab, name)
+            if center is None:
+                continue
+            atom_ids = self._nearest_surface_atoms_for_site_name(slab, center, surface_ids, name)
+            if len(atom_ids) <= 0:
+                continue
+            c0, normal, t1, t2 = self.frame_builder.build(slab=slab, atom_ids=atom_ids, global_normal=global_normal)
+            _ = c0
+            kind = f"{len(atom_ids)}c"
+            topo_hash = self._make_topo_hash(kind, atom_ids, graph)
+            out.append(
+                SitePrimitive(
+                    kind=kind,
+                    atom_ids=atom_ids,
+                    center=np.asarray(center, dtype=float),
+                    normal=normal,
+                    t1=t1,
+                    t2=t2,
+                    topo_hash=topo_hash,
+                )
+            )
+        if not out:
+            return None
+        kind_order = {"1c": 0, "2c": 1, "3c": 2, "4c": 3}
+        out.sort(key=lambda p: (kind_order.get(p.kind, 99), p.atom_ids))
+        return out
+
+    @staticmethod
+    def _ase_site_center(slab: Atoms, site_name: str) -> np.ndarray | None:
+        try:
+            probe = slab.copy()
+            add_adsorbate(probe, Atom("He"), 0.0, position=str(site_name))
+            return np.asarray(probe.positions[-1], dtype=float)
+        except Exception:
+            return None
+
+    def _nearest_surface_atoms_for_site_name(
+        self,
+        slab: Atoms,
+        center: np.ndarray,
+        surface_ids: list[int],
+        site_name: str,
+    ) -> tuple[int, ...]:
+        lname = str(site_name).lower()
+        if lname == "ontop":
+            n = 1
+        elif "bridge" in lname:
+            n = 2
+        elif lname in {"fcc", "hcp"}:
+            n = 3
+        elif lname == "hollow":
+            n = self._infer_hollow_coordination(slab, center, surface_ids)
+        else:
+            n = 1
+        return self._nearest_surface_atoms(slab=slab, center=center, surface_ids=surface_ids, n=n)
+
+    def _infer_hollow_coordination(self, slab: Atoms, center: np.ndarray, surface_ids: list[int]) -> int:
+        if len(surface_ids) < 4:
+            return 3
+        d = []
+        for i in surface_ids:
+            di = self._mic_point_distance(np.asarray(slab.positions[int(i)], dtype=float), np.asarray(center, dtype=float), slab)
+            d.append(float(di))
+        d = np.sort(np.asarray(d, dtype=float))
+        if d.shape[0] < 4:
+            return 3
+        r = float((d[3] + 1e-12) / (d[2] + 1e-12))
+        return 4 if r < 1.12 else 3
+
+    def _nearest_surface_atoms(self, slab: Atoms, center: np.ndarray, surface_ids: list[int], n: int) -> tuple[int, ...]:
+        if n <= 0 or not surface_ids:
+            return tuple()
+        ds = []
+        for i in surface_ids:
+            di = self._mic_point_distance(np.asarray(slab.positions[int(i)], dtype=float), np.asarray(center, dtype=float), slab)
+            ds.append((float(di), int(i)))
+        ds.sort(key=lambda x: (x[0], x[1]))
+        return tuple(sorted(int(i) for _, i in ds[: int(n)]))
 
     @staticmethod
     def _make_topo_hash(kind: str, atom_ids: tuple[int, ...], graph: ExposedSurfaceGraph) -> str:
@@ -215,6 +324,10 @@ class PrimitiveBuilder:
                 area = self._site_area(positions[list(p.atom_ids)], tangential_axes)
                 if area < self.min_polygon_area:
                     continue
+            if p.kind == "4c":
+                max_dev = self._quad_max_angle_deviation_from_right(positions[list(p.atom_ids)], tangential_axes)
+                if max_dev > 25.0:
+                    continue
             if len(p.atom_ids) >= 2:
                 dmin = self._point_to_surface_min_distance_mic(slab, p.center, surface_ids)
                 if dmin < dyn_center_cut and len(p.atom_ids) >= 3:
@@ -236,6 +349,32 @@ class PrimitiveBuilder:
         y = poly[:, 1]
         area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
         return float(area)
+
+    @staticmethod
+    def _quad_max_angle_deviation_from_right(points: np.ndarray, tangential_axes: list[int]) -> float:
+        if points.shape[0] != 4:
+            return 180.0
+        xy = points[:, tangential_axes]
+        c = np.mean(xy, axis=0)
+        vec = xy - c
+        ang = np.arctan2(vec[:, 1], vec[:, 0])
+        order = np.argsort(ang)
+        poly = xy[order]
+        max_dev = 0.0
+        for i in range(4):
+            p_prev = poly[(i - 1) % 4]
+            p_now = poly[i]
+            p_next = poly[(i + 1) % 4]
+            v1 = p_prev - p_now
+            v2 = p_next - p_now
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 < 1e-12 or n2 < 1e-12:
+                return 180.0
+            cang = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+            angle_deg = float(np.degrees(np.arccos(cang)))
+            max_dev = max(max_dev, abs(angle_deg - 90.0))
+        return float(max_dev)
 
     @staticmethod
     def _surface_nearest_neighbor_distance(slab: Atoms, surface_ids: list[int]) -> float:
@@ -269,9 +408,9 @@ class PrimitiveBuilder:
         order = sorted(
             range(len(primitives)),
             key=lambda i: (
-                -len(primitives[i].atom_ids),
-                primitives[i].kind,
+                {"1c": 0, "2c": 1, "3c": 2, "4c": 3}.get(str(primitives[i].kind), 99),
                 primitives[i].topo_hash,
+                -len(primitives[i].atom_ids),
             ),
         )
         kept: list[SitePrimitive] = []

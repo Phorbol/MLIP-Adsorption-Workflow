@@ -11,6 +11,8 @@ from .primitives import SitePrimitive
 @dataclass
 class PrimitiveEmbeddingConfig:
     l2_distance_threshold: float = 0.30
+    include_geom_aux: bool = True
+    geom_k_nearest: int = 6
 
 
 @dataclass
@@ -36,7 +38,7 @@ class PrimitiveEmbedder:
     ) -> PrimitiveEmbeddingResult:
         self._validate_inputs(slab, primitives, atom_features)
         for p in primitives:
-            p.embedding = self._build_primitive_embedding(p, atom_features)
+            p.embedding = self._build_primitive_embedding(p, atom_features=atom_features, slab=slab, config=self.config)
         buckets = self._bucket_by_topology(primitives)
         assigned = self._cluster_within_buckets(primitives, buckets)
         basis_ids = sorted({int(x) for x in assigned if x is not None})
@@ -70,11 +72,53 @@ class PrimitiveEmbedder:
             raise ValueError("atom_features must have non-zero feature dimension.")
 
     @staticmethod
-    def _build_primitive_embedding(primitive: SitePrimitive, atom_features: np.ndarray) -> np.ndarray:
+    def _build_primitive_embedding(
+        primitive: SitePrimitive,
+        atom_features: np.ndarray,
+        slab: Atoms,
+        config: PrimitiveEmbeddingConfig,
+    ) -> np.ndarray:
         idx = np.array(primitive.atom_ids, dtype=int)
         feats = atom_features[idx]
         mean_feat = np.mean(feats, axis=0)
-        return np.asarray(mean_feat, dtype=float)
+        kind_map = {"1c": 0, "2c": 1, "3c": 2, "4c": 3}
+        one_hot = np.zeros(4, dtype=float)
+        one_hot[kind_map.get(str(primitive.kind), 0)] = 1.0
+        if not bool(config.include_geom_aux):
+            return np.asarray(np.concatenate([mean_feat, one_hot]), dtype=float)
+        dfeat = PrimitiveEmbedder._center_distance_fingerprint(
+            slab=slab,
+            center=np.asarray(primitive.center, dtype=float),
+            k=max(0, int(config.geom_k_nearest)),
+        )
+        return np.asarray(np.concatenate([mean_feat, one_hot, dfeat]), dtype=float)
+
+    @staticmethod
+    def _center_distance_fingerprint(slab: Atoms, center: np.ndarray, k: int) -> np.ndarray:
+        if k <= 0 or len(slab) <= 0:
+            return np.zeros(max(0, k), dtype=float)
+        cell = np.asarray(slab.cell.array, dtype=float)
+        pbc = slab.get_pbc()
+        vec = np.asarray(slab.get_positions(), dtype=float) - center.reshape(1, 3)
+        try:
+            frac = np.linalg.solve(cell.T, vec.T).T
+            for ax in range(3):
+                if bool(pbc[ax]):
+                    frac[:, ax] -= np.round(frac[:, ax])
+            vec = frac @ cell
+        except Exception:
+            pass
+        d = np.linalg.norm(vec, axis=1)
+        d_sorted = np.sort(np.asarray(d, dtype=float))
+        out = np.zeros(k, dtype=float)
+        take = min(k, int(d_sorted.shape[0]))
+        if take > 0:
+            out[:take] = d_sorted[:take]
+        nz = d_sorted[d_sorted > 1e-8]
+        scale = float(nz[0]) if nz.size > 0 else 1.0
+        if scale <= 1e-8:
+            scale = 1.0
+        return out / scale
 
     @staticmethod
     def _bucket_by_topology(primitives: list[SitePrimitive]) -> dict[str, list[int]]:

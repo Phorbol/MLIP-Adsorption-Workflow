@@ -86,7 +86,8 @@ def run_adsorption_workflow(
     primitives = list(raw_primitives)
     atom_features = _make_atomic_number_features(slab)
     embed_result = PrimitiveEmbedder(cfg.primitive_embedding_config).fit_transform(slab=slab, primitives=primitives, atom_features=atom_features)
-    primitives = list(embed_result.primitives)
+    # Sampling should operate on inequivalent-site representatives.
+    primitives = list(embed_result.basis_primitives)
     if cfg.max_selected_primitives is not None:
         primitives = primitives[: max(0, int(cfg.max_selected_primitives))]
 
@@ -315,7 +316,26 @@ def _sample_with_fallback(
     retry_cfg.site_contact_tolerance = float(retry_cfg.site_contact_tolerance + 0.15)
     retry_cfg.random_seed = int(retry_cfg.random_seed) + 17
     retry_sampler = PoseSampler(retry_cfg)
-    return retry_sampler.sample(
+    poses = retry_sampler.sample(
+        slab=slab,
+        adsorbate=adsorbate,
+        primitives=primitives,
+        surface_atom_ids=surface_atom_ids,
+    )
+    if poses:
+        return poses
+    # Second-stage fallback for hard surfaces (e.g., covalent/oxide terminations):
+    # start from a higher height window and looser contact constraints.
+    retry2_cfg = PoseSamplerConfig(**vars(retry_cfg))
+    retry2_cfg.min_height = float(max(retry2_cfg.min_height, 2.2))
+    retry2_cfg.max_height = float(max(retry2_cfg.max_height + 1.8, retry2_cfg.min_height + 2.6))
+    retry2_cfg.height_step = float(min(retry2_cfg.height_step, 0.20))
+    retry2_cfg.clash_tau = float(max(0.60, retry2_cfg.clash_tau - 0.05))
+    retry2_cfg.site_contact_tolerance = float(retry2_cfg.site_contact_tolerance + 1.20)
+    retry2_cfg.n_azimuth = int(max(6, retry2_cfg.n_azimuth))
+    retry2_cfg.n_shifts = int(max(2, retry2_cfg.n_shifts))
+    retry2_cfg.random_seed = int(retry2_cfg.random_seed) + 23
+    return PoseSampler(retry2_cfg).sample(
         slab=slab,
         adsorbate=adsorbate,
         primitives=primitives,

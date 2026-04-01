@@ -13,8 +13,12 @@ class BasinConfig:
     relax_steps: int = 80
     energy_window_ev: float = 0.20
     dedup_metric: str = "rmsd"
+    dedup_cluster_method: str = "greedy"
     rmsd_threshold: float = 0.10
-    mace_node_l2_threshold: float = 2.0
+    mace_node_l2_threshold: float = 0.20
+    mace_node_l2_mode: str = "mean_atom"
+    fuzzy_membership_cutoff: float = 0.50
+    fuzzy_sigma_scale: float = 1.50
     mace_model_path: str | None = None
     mace_device: str = "cpu"
     mace_dtype: str = "float32"
