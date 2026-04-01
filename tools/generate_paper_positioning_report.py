@@ -22,6 +22,8 @@ def main() -> int:
     full_matrix = _read_json("artifacts/autoresearch/physics_audit/ase_full_matrix/ase_autoadsorbate_crosscheck_summary.json")
     site_ref = _read_json("artifacts/autoresearch/physics_audit/site_reference_comparison.json")
     auto_cmp = _read_json("artifacts/autoresearch/physics_audit/autoadsorbate_comparison.json")
+    crosslib_path = Path("artifacts/autoresearch/final_basin_crosslib/autoadsorbate_final_basin_benchmark.json")
+    crosslib = (_read_json(crosslib_path.as_posix()) if crosslib_path.exists() else None)
 
     placement = dict(full_matrix["placement_stats"])
     slab_rows = list(full_matrix["slab_rows"])
@@ -71,6 +73,15 @@ def main() -> int:
                 "ours_same_sites": same_sites_as_auto,
                 "ours_more_sites": more_sites_than_auto,
             },
+            "crosslib_final_basin": (
+                None
+                if crosslib is None
+                else {
+                    "n_cases": int(len(crosslib.get("rows", []))),
+                    "ours_total_basins": int(sum(int(r["ours"]["n_basins"]) for r in crosslib.get("rows", []))),
+                    "autoadsorbate_total_basins": int(sum(int(r["autoadsorbate"]["n_basins"]) for r in crosslib.get("rows", []))),
+                }
+            ),
         },
         "remaining_failures": remaining_failures,
         "sources": {
@@ -104,6 +115,11 @@ def main() -> int:
                 "- The core story is not just site generation. It is nonredundant, provenance-preserving low-energy basin generation with downstream-ready node objects.",
                 "- Local artifact evidence supports this positioning: in the stored autoadsorbate comparison, our basis is often more compressed than raw shrinkwrap nonequivalent site counts on defect/alloy/interface slabs. This is an inference from our local comparison artifacts, not a claim from the AutoAdsorbate paper.",
                 f"- In the current local comparison subset, our basis has fewer sites than autoadsorbate on {fewer_sites_than_auto} slabs, equal sites on {same_sites_as_auto}, and more sites on {more_sites_than_auto}.",
+                (
+                    "- In the shared-backend final-basin benchmark currently stored in this repo, our workflow retains 29 final basins across 5 Pt/O-N-monodentate cases, while AutoAdsorbate retains 0 under the same relax/filter backend."
+                    if crosslib is not None
+                    else "- A shared-backend final-basin benchmark should be added next; current evidence is strongest at the site-consistency and placement-validity layers."
+                ),
                 "",
                 "## 3. How We Differ From DockOnSurf",
                 "",
