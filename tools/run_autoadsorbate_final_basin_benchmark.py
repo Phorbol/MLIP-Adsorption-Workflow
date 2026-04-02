@@ -12,12 +12,13 @@ from ase.build import fcc100, fcc111, fcc211
 from ase.io import write
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
-from adsorption_ensemble.basin.dedup import kabsch_rmsd
-from adsorption_ensemble.pose import PoseSamplerConfig
+from adsorption_ensemble.basin.dedup import symmetry_aware_kabsch_rmsd
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
-from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, run_adsorption_workflow
-from adsorption_ensemble.site import PrimitiveEmbeddingConfig
-from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
+from adsorption_ensemble.workflows import (
+    generate_adsorption_ensemble,
+    list_sampling_schedule_presets,
+    make_sampling_schedule,
+)
 from autoadsorbate import Surface, get_marked_smiles
 from autoadsorbate.Smile import atoms_from_smile, create_adsorbates
 from autoadsorbate.Surf import _place_adsorbate
@@ -36,57 +37,23 @@ def _make_relax_backend() -> MACEBatchRelaxBackend:
     )
 
 
-def _make_workflow_config(work_dir: Path) -> AdsorptionWorkflowConfig:
-    return AdsorptionWorkflowConfig(
-        work_dir=work_dir,
-        surface_preprocessor=SurfacePreprocessor(
-            min_surface_atoms=6,
-            primary_detector=ProbeScanDetector(grid_step=0.55),
-            fallback_detector=VoxelFloodDetector(spacing=0.75),
-            target_surface_fraction=None,
-            target_count_mode="off",
-        ),
-        pose_sampler_config=PoseSamplerConfig(
-            n_rotations=4,
-            n_azimuth=8,
-            n_shifts=2,
-            shift_radius=0.20,
-            min_height=1.4,
-            max_height=3.6,
-            height_step=0.15,
-            max_poses_per_site=4,
-            random_seed=0,
-        ),
-        basin_config=BasinConfig(
-            relax_maxf=0.1,
-            relax_steps=80,
-            energy_window_ev=2.5,
-            dedup_metric="rmsd",
-            dedup_cluster_method="hierarchical",
-            rmsd_threshold=0.10,
-            desorption_min_bonds=0,
-            work_dir=None,
-        ),
-        max_primitives=None,
-        max_selected_primitives=24,
-        save_basin_dictionary=True,
-        save_basin_ablation=False,
-        save_site_visualizations=True,
-        save_raw_site_dictionary=True,
-        save_selected_site_dictionary=True,
-        primitive_embedding_config=PrimitiveEmbeddingConfig(l2_distance_threshold=0.20),
-    )
-
-
-def _unified_basin_config(work_dir: Path) -> BasinConfig:
+def _unified_basin_config(
+    work_dir: Path,
+    *,
+    dedup_metric: str,
+    signature_mode: str,
+    post_relax_selection: object | None,
+) -> BasinConfig:
     return BasinConfig(
         relax_maxf=0.1,
         relax_steps=80,
         energy_window_ev=2.5,
-        dedup_metric="rmsd",
+        dedup_metric=str(dedup_metric),
+        signature_mode=str(signature_mode),
         dedup_cluster_method="hierarchical",
         rmsd_threshold=0.10,
-        desorption_min_bonds=0,
+        desorption_min_bonds=1,
+        post_relax_selection=post_relax_selection,
         work_dir=work_dir,
     )
 
@@ -167,12 +134,13 @@ def _basin_overlap(ours_frames: list[Atoms], other_frames: list[Atoms], slab_n: 
     matches = []
     for j, b in enumerate(other_frames):
         b_pos = np.asarray(b.get_positions(), dtype=float)[slab_n:]
+        b_ads = b[slab_n:]
         found = None
         for i, a in enumerate(ours_frames):
             if str(a.info.get("signature", "")) != str(b.info.get("signature", "")):
                 continue
             a_pos = np.asarray(a.get_positions(), dtype=float)[slab_n:]
-            d = float(kabsch_rmsd(a_pos, b_pos))
+            d = float(symmetry_aware_kabsch_rmsd(a_pos, b_pos, b_ads))
             if np.isfinite(d) and d <= float(rmsd_threshold):
                 found = {"ours_index": int(i), "other_index": int(j), "rmsd": float(d), "signature": str(a.info.get("signature", ""))}
                 break
@@ -194,12 +162,21 @@ def _run_autoadsorbate_basins(
     smiles: str,
     work_dir: Path,
     relax_backend: MACEBatchRelaxBackend,
+    *,
+    dedup_metric: str,
+    signature_mode: str,
+    post_relax_selection: object | None,
 ) -> tuple[list[Atoms], dict[str, Any]]:
     base_ads = atoms_from_smile(smiles)
     frames, gen_meta = _build_autoadsorbate_frames(slab=slab, smiles=smiles, out_dir=work_dir)
     if not frames:
         return [], {"generator": dict(gen_meta), "basin_summary": {"n_input": 0, "n_basins": 0}}
-    basin_cfg = _unified_basin_config(work_dir=work_dir / "basin_work")
+    basin_cfg = _unified_basin_config(
+        work_dir=work_dir / "basin_work",
+        dedup_metric=str(dedup_metric),
+        signature_mode=str(signature_mode),
+        post_relax_selection=post_relax_selection,
+    )
     result = BasinBuilder(config=basin_cfg, relax_backend=relax_backend).build(
         frames=frames,
         slab_ref=slab,
@@ -238,11 +215,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-root", type=str, default="artifacts/autoresearch/final_basin_crosslib")
     parser.add_argument("--max-cases", type=int, default=0)
+    parser.add_argument("--placement-mode", type=str, default="anchor_free", choices=["anchor_free", "anchor_aware"])
+    parser.add_argument("--schedule-preset", type=str, default="multistage_default", choices=list_sampling_schedule_presets())
+    parser.add_argument("--dedup-metric", type=str, default="rmsd")
+    parser.add_argument("--signature-mode", type=str, default="provenance", choices=["absolute", "canonical", "provenance", "none"])
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     relax_backend = _make_relax_backend()
+    schedule = make_sampling_schedule(str(args.schedule_preset))
 
     rows = []
     cases = _build_cases()
@@ -255,19 +237,22 @@ def main() -> int:
         smiles = str(case["smiles"])
         ads = atoms_from_smile(smiles)
 
-        ours_cfg = _make_workflow_config(case_dir / "ours")
-        ours_result = run_adsorption_workflow(
+        ours_result = generate_adsorption_ensemble(
             slab=slab,
             adsorbate=ads,
-            config=ours_cfg,
+            work_dir=case_dir / "ours",
+            placement_mode=str(args.placement_mode),
+            schedule=schedule,
+            dedup_metric=str(args.dedup_metric),
+            signature_mode=str(args.signature_mode),
             basin_relax_backend=relax_backend,
         )
         ours_basins = []
-        if ours_result.artifacts.get("basins_extxyz"):
+        if ours_result.files.get("basins_extxyz"):
             try:
                 from ase.io import read
 
-                ours_basins = list(read(ours_result.artifacts["basins_extxyz"], index=":"))
+                ours_basins = list(read(ours_result.files["basins_extxyz"], index=":"))
             except Exception:
                 ours_basins = []
 
@@ -276,6 +261,9 @@ def main() -> int:
             smiles=smiles,
             work_dir=case_dir / "autoadsorbate",
             relax_backend=relax_backend,
+            dedup_metric=str(args.dedup_metric),
+            signature_mode=str(args.signature_mode),
+            post_relax_selection=schedule.post_relax_selection,
         )
         overlap = _basin_overlap(ours_frames=ours_basins, other_frames=auto_basins, slab_n=len(slab), rmsd_threshold=0.20)
         row = {
@@ -285,7 +273,10 @@ def main() -> int:
                 "n_surface_atoms": int(ours_result.summary["n_surface_atoms"]),
                 "n_basis_primitives": int(ours_result.summary["n_basis_primitives"]),
                 "n_pose_frames": int(ours_result.summary["n_pose_frames"]),
+                "n_pose_frames_selected_for_basin": int(ours_result.summary["n_pose_frames_selected_for_basin"]),
                 "n_basins": int(ours_result.summary["n_basins"]),
+                "placement_mode": str(args.placement_mode),
+                "schedule_name": str(ours_result.summary["schedule"]["name"]),
                 "work_dir": (case_dir / "ours").as_posix(),
             },
             "autoadsorbate": {
@@ -297,9 +288,24 @@ def main() -> int:
         }
         rows.append(row)
 
+    total_ours_pose_frames = int(sum(int(r["ours"]["n_pose_frames"]) for r in rows))
+    total_ours_pose_frames_selected_for_basin = int(
+        sum(int(r["ours"]["n_pose_frames_selected_for_basin"]) for r in rows)
+    )
+    total_ours_basins = int(sum(int(r["ours"]["n_basins"]) for r in rows))
+    total_autoadsorbate_basins = int(sum(int(r["autoadsorbate"]["n_basins"]) for r in rows))
     summary = {
         "out_root": out_root.as_posix(),
         "mace_model_path": "/root/.cache/mace/mace-omat-0-small.model",
+        "placement_mode": str(args.placement_mode),
+        "schedule_preset": str(args.schedule_preset),
+        "schedule_name": str(schedule.name),
+        "dedup_metric": str(args.dedup_metric),
+        "signature_mode": str(args.signature_mode),
+        "total_ours_pose_frames": int(total_ours_pose_frames),
+        "total_ours_pose_frames_selected_for_basin": int(total_ours_pose_frames_selected_for_basin),
+        "total_ours_basins": int(total_ours_basins),
+        "total_autoadsorbate_basins": int(total_autoadsorbate_basins),
         "rows": rows,
         "notes": {
             "autoadsorbate_scope": "This benchmark uses AutoAdsorbate marked-SMILES O/N monodentate pathway and its shrinkwrap top-site generation, then relaxes all candidates with the same MACE backend used by our workflow.",
@@ -314,4 +320,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    slab_n = len(slab)

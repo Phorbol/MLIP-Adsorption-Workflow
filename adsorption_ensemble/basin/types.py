@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 from ase import Atoms
 
+from adsorption_ensemble.selection import StageSelectionConfig
+
 
 @dataclass
 class BasinConfig:
@@ -13,6 +15,7 @@ class BasinConfig:
     relax_steps: int = 80
     energy_window_ev: float = 0.20
     dedup_metric: str = "rmsd"
+    signature_mode: str = "absolute"
     dedup_cluster_method: str = "greedy"
     rmsd_threshold: float = 0.10
     mace_node_l2_threshold: float = 0.20
@@ -31,6 +34,7 @@ class BasinConfig:
     surface_reconstruction_max_disp: float = 0.50
     dissociation_allow_bond_change: bool = False
     burial_margin: float = 0.30
+    post_relax_selection: StageSelectionConfig | None = None
     work_dir: Path | None = None
 
 

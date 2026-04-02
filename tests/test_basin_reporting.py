@@ -79,6 +79,8 @@ class TestBasinReporting(unittest.TestCase):
             basin_dict = build_basin_dictionary(result.basin_result, pose_frames=result.pose_frames, nodes=nodes, slab_n=len(slab))
             self.assertIn("basins", basin_dict)
             self.assertGreaterEqual(len(basin_dict["basins"]), 1)
+            self.assertIn("binding_adsorbate_symbols", basin_dict["basins"][0])
+            self.assertIn("member_site_labels", basin_dict["basins"][0])
             ablation = run_basin_ablation(
                 frames=result.pose_frames,
                 slab_ref=slab,

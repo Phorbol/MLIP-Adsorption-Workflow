@@ -27,10 +27,18 @@ from .visualization.sites import (
 )
 from .workflows import run_pose_sampling_smoke, validate_pose_sampling_run
 from .workflows import (
+    AdsorptionEnsembleRequest,
+    AdsorptionEnsembleResult,
     AdsorptionWorkflowConfig,
     AdsorptionWorkflowResult,
     PaperReadinessReport,
+    SamplingSchedule,
     evaluate_adsorption_workflow_readiness,
+    generate_adsorption_ensemble,
+    make_adsorption_workflow_config,
+    make_pose_sampler_config,
+    make_sampling_schedule,
+    list_sampling_schedule_presets,
     run_adsorption_workflow,
 )
 from .conformer_md import (
@@ -96,7 +104,15 @@ __all__ = [
     "plot_site_embedding_pca",
     "AdsorptionWorkflowConfig",
     "AdsorptionWorkflowResult",
+    "AdsorptionEnsembleRequest",
+    "AdsorptionEnsembleResult",
+    "SamplingSchedule",
     "run_adsorption_workflow",
+    "generate_adsorption_ensemble",
+    "make_sampling_schedule",
+    "list_sampling_schedule_presets",
+    "make_pose_sampler_config",
+    "make_adsorption_workflow_config",
     "PaperReadinessReport",
     "evaluate_adsorption_workflow_readiness",
     "run_pose_sampling_smoke",

@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 import tempfile
 
+import numpy as np
 from ase.build import fcc111, molecule
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
@@ -57,3 +58,31 @@ class TestBasinPipeline(unittest.TestCase):
         member_counts = sorted(len(b.member_candidate_ids) for b in out.basins)
         self.assertEqual(member_counts, [1, 2])
 
+    def test_basin_builder_rejects_desorbed_candidates_when_required(self):
+        slab = fcc111("Pt", size=(3, 3, 4), vacuum=12.0)
+        ads = molecule("CO")
+        adsorbed = slab.copy() + ads.copy()
+        adsorbed.positions[len(slab) :] += slab.positions[0] + np.array([0.0, 0.0, 1.85])
+        desorbed = slab.copy() + ads.copy()
+        desorbed.positions[len(slab) :] += np.array([0.0, 0.0, 8.0])
+        with tempfile.TemporaryDirectory() as td:
+            cfg = BasinConfig(
+                relax_maxf=0.1,
+                relax_steps=1,
+                energy_window_ev=2.0,
+                rmsd_threshold=0.10,
+                desorption_min_bonds=1,
+                work_dir=Path(td),
+            )
+            out = BasinBuilder(config=cfg).build(
+                frames=[adsorbed, desorbed],
+                slab_ref=slab,
+                adsorbate_ref=ads,
+                slab_n=len(slab),
+                normal_axis=2,
+            )
+        self.assertEqual(out.summary["n_input"], 2)
+        self.assertEqual(out.summary["n_rejected"], 1)
+        self.assertEqual(len(out.rejected), 1)
+        self.assertEqual(out.rejected[0].reason, "desorption")
+        self.assertEqual(out.summary["n_basins"], 1)

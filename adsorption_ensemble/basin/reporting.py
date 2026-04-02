@@ -11,6 +11,59 @@ from adsorption_ensemble.basin.types import BasinConfig, BasinResult
 from adsorption_ensemble.node.types import ReactionNode
 
 
+def describe_basin_binding(*, basin_atoms: Atoms, slab_n: int, binding_pairs: list[tuple[int, int]]) -> dict[str, Any]:
+    ads = basin_atoms[int(slab_n) :].copy()
+    slab = basin_atoms[: int(slab_n)].copy()
+    ads_idx = sorted({int(i) for i, _ in binding_pairs})
+    slab_idx = sorted({int(j) for _, j in binding_pairs})
+    return {
+        "binding_adsorbate_indices": [int(i) for i in ads_idx],
+        "binding_adsorbate_symbols": [str(ads[int(i)].symbol) for i in ads_idx if 0 <= int(i) < len(ads)],
+        "binding_surface_atom_ids": [int(j) for j in slab_idx],
+        "binding_surface_symbols": [str(slab[int(j)].symbol) for j in slab_idx if 0 <= int(j) < len(slab)],
+    }
+
+
+def summarize_basin_member_provenance(member_frames: list[Atoms]) -> dict[str, Any]:
+    site_labels = []
+    basis_ids = []
+    primitive_indices = []
+    conformer_ids = []
+    placement_modes = []
+    for frame in member_frames:
+        site_label = str(frame.info.get("site_label", "")).strip()
+        if site_label:
+            site_labels.append(site_label)
+        basis_id = frame.info.get("basis_id", None)
+        if basis_id is not None:
+            try:
+                basis_ids.append(int(basis_id))
+            except Exception:
+                pass
+        primitive_index = frame.info.get("primitive_index", None)
+        if primitive_index is not None:
+            try:
+                primitive_indices.append(int(primitive_index))
+            except Exception:
+                pass
+        conformer_id = frame.info.get("conformer_id", None)
+        if conformer_id is not None:
+            try:
+                conformer_ids.append(int(conformer_id))
+            except Exception:
+                pass
+        placement_mode = str(frame.info.get("placement_mode", "")).strip()
+        if placement_mode:
+            placement_modes.append(placement_mode)
+    return {
+        "member_site_labels": sorted(set(site_labels)),
+        "member_basis_ids": sorted(set(basis_ids)),
+        "member_primitive_indices": sorted(set(primitive_indices)),
+        "member_conformer_ids": sorted(set(conformer_ids)),
+        "member_placement_modes": sorted(set(placement_modes)),
+    }
+
+
 def build_basin_dictionary(
     basin_result: BasinResult,
     *,
@@ -41,6 +94,12 @@ def build_basin_dictionary(
                 energy_values.extend(member_energies)
                 energy_span = float(np.max(member_energies) - np.min(member_energies))
         rmsd_stats = _member_rmsd_stats(member_frames=member_frames, slab_n=slab_n)
+        binding_meta = describe_basin_binding(
+            basin_atoms=basin.atoms,
+            slab_n=(0 if slab_n is None else int(slab_n)),
+            binding_pairs=list(basin.binding_pairs),
+        )
+        provenance_meta = summarize_basin_member_provenance(member_frames)
         node = node_by_basin.get(int(basin.basin_id))
         basin_entries.append(
             {
@@ -59,6 +118,8 @@ def build_basin_dictionary(
                 "member_adsorbate_rmsd_mean": rmsd_stats["mean"],
                 "false_merge_suspect": bool(rmsd_stats["max"] is not None and rmsd_stats["max"] > 0.75),
                 "node_id": (None if node is None else str(node.node_id)),
+                **binding_meta,
+                **provenance_meta,
             }
         )
     signature_groups: dict[str, int] = {}

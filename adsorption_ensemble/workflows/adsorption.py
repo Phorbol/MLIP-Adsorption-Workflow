@@ -13,6 +13,7 @@ from adsorption_ensemble.basin import BasinBuilder, BasinConfig, BasinResult, bu
 from adsorption_ensemble.conformer_md import ConformerEnsemble, ConformerMDSampler, ConformerMDSamplerConfig
 from adsorption_ensemble.node import NodeConfig, ReactionNode, basin_to_node
 from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
+from adsorption_ensemble.selection import StageSelectionConfig, apply_stage_selection, stage_selection_summary
 from adsorption_ensemble.site import PrimitiveBuilder, PrimitiveEmbedder, PrimitiveEmbeddingConfig, build_site_dictionary
 from adsorption_ensemble.surface import SurfaceContext, SurfacePreprocessor, export_surface_detection_report
 from adsorption_ensemble.visualization import (
@@ -21,6 +22,7 @@ from adsorption_ensemble.visualization import (
     plot_site_embedding_pca,
     plot_surface_primitives_2d,
 )
+from adsorption_ensemble.basin.reporting import describe_basin_binding, summarize_basin_member_provenance
 
 
 @dataclass
@@ -46,6 +48,7 @@ class AdsorptionWorkflowConfig:
     save_raw_site_dictionary: bool = True
     save_selected_site_dictionary: bool = True
     primitive_embedding_config: PrimitiveEmbeddingConfig = field(default_factory=PrimitiveEmbeddingConfig)
+    pre_relax_selection: StageSelectionConfig = field(default_factory=StageSelectionConfig)
 
 
 @dataclass
@@ -147,23 +150,47 @@ def run_adsorption_workflow(
         )
         for pose in poses:
             frame = slab + pose.atoms
+            primitive = primitives[int(pose.primitive_index)]
             frame.info["conformer_id"] = int(conformer_id)
             frame.info["primitive_index"] = int(pose.primitive_index)
             frame.info["basis_id"] = (-1 if pose.basis_id is None else int(pose.basis_id))
+            frame.info["site_kind"] = str(primitive.kind)
+            frame.info["site_label"] = (
+                str(primitive.site_label)
+                if getattr(primitive, "site_label", None) is not None
+                else f"{primitive.kind}|basis={(-1 if pose.basis_id is None else int(pose.basis_id))}"
+            )
             frame.info["rotation_index"] = int(pose.rotation_index)
             frame.info["azimuth_index"] = int(pose.azimuth_index)
             frame.info["height_shift_index"] = int(pose.height_shift_index)
             frame.info["height"] = float(pose.height)
+            frame.info["placement_mode"] = str(cfg.pose_sampler_config.placement_mode)
+            frame.info["anchor_free_reference"] = str(cfg.pose_sampler_config.anchor_free_reference)
             pose_frames.append(frame)
     if bool(cfg.save_pose_pool) and pose_frames:
         pose_pool_path = work_dir / "pose_pool.extxyz"
         write(pose_pool_path.as_posix(), pose_frames)
         artifacts["pose_pool_extxyz"] = pose_pool_path.as_posix()
 
+    pre_relax_selected_ids, pre_relax_diag = apply_stage_selection(
+        frames=pose_frames,
+        config=cfg.pre_relax_selection,
+        slab_n=len(slab),
+        energies=None,
+    )
+    basin_input_frames = [pose_frames[i] for i in pre_relax_selected_ids]
+    if basin_input_frames and bool(cfg.pre_relax_selection.enabled):
+        basin_input_path = work_dir / "pose_pool_selected.extxyz"
+        write(basin_input_path.as_posix(), basin_input_frames)
+        artifacts["pose_pool_selected_extxyz"] = basin_input_path.as_posix()
+        pre_relax_diag_path = work_dir / "pre_relax_selection.json"
+        _write_json(pre_relax_diag_path, pre_relax_diag)
+        artifacts["pre_relax_selection_json"] = pre_relax_diag_path.as_posix()
+
     basin_cfg = cfg.basin_config
     basin_cfg.work_dir = work_dir / "basin_work"
     basin_result = BasinBuilder(config=basin_cfg, relax_backend=basin_relax_backend).build(
-        frames=pose_frames,
+        frames=basin_input_frames,
         slab_ref=slab,
         adsorbate_ref=adsorbate,
         slab_n=len(slab),
@@ -195,6 +222,10 @@ def run_adsorption_workflow(
                     "signature": str(b.signature),
                     "member_candidate_ids": [int(x) for x in b.member_candidate_ids],
                     "binding_pairs": [(int(i), int(j)) for i, j in b.binding_pairs],
+                    **describe_basin_binding(basin_atoms=b.atoms, slab_n=len(slab), binding_pairs=list(b.binding_pairs)),
+                    **summarize_basin_member_provenance(
+                        [pose_frames[int(x)] for x in b.member_candidate_ids if 0 <= int(x) < len(pose_frames)]
+                    ),
                 }
                 for b in basin_result.basins
             ],
@@ -264,9 +295,11 @@ def run_adsorption_workflow(
         "n_basis_primitives": int(len(embed_result.basis_primitives)),
         "n_conformers": int(len(conformers)),
         "n_pose_frames": int(len(pose_frames)),
+        "n_pose_frames_selected_for_basin": int(len(basin_input_frames)),
         "n_basins": int(len(basin_result.basins)),
         "n_nodes": int(len(nodes)),
         "run_conformer_search": bool(cfg.run_conformer_search),
+        "pre_relax_selection": stage_selection_summary(cfg.pre_relax_selection),
     }
     summary_path = work_dir / "workflow_summary.json"
     _write_json(summary_path, summary)

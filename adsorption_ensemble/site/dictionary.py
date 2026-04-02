@@ -25,6 +25,7 @@ def build_site_dictionary(primitives: list[SitePrimitive]) -> dict[str, Any]:
             "t2": _to_list(p.t2),
             "topo_hash": p.topo_hash,
             "basis_id": basis_id,
+            "site_label": (None if p.site_label is None else str(p.site_label)),
             "embedding": None if p.embedding is None else _to_list(p.embedding),
         }
         sites[site_id] = record

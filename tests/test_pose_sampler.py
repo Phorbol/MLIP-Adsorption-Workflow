@@ -1,7 +1,8 @@
 import unittest
 
 import numpy as np
-from ase.build import fcc111, molecule
+from ase import Atoms
+from ase.build import fcc100, fcc110, fcc111, molecule
 from ase.data import covalent_radii
 from ase.geometry.geometry import general_find_mic
 
@@ -139,6 +140,169 @@ class TestPoseSampler(unittest.TestCase):
         self.assertGreater(len(out), 0)
         self.assertEqual({int(p.azimuth_index) for p in out}, {0})
         self.assertEqual({int(p.rotation_index) for p in out}, {0})
+
+    def test_pose_sampler_covers_multicenter_sites_for_monatomic_adsorbate(self):
+        cases = [
+            (fcc100("Pt", size=(4, 4, 4), vacuum=12.0), 3),
+            (fcc110("Pt", size=(4, 4, 4), vacuum=12.0), 4),
+        ]
+        ads = Atoms("H", positions=[[0.0, 0.0, 0.0]])
+        cfg = PoseSamplerConfig(
+            n_rotations=1,
+            n_azimuth=1,
+            n_shifts=1,
+            shift_radius=0.0,
+            min_height=0.8,
+            max_height=2.2,
+            height_step=0.1,
+            max_poses_per_site=2,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+        )
+        sampler = PoseSampler(cfg)
+        for slab, expected_n_sites in cases:
+            ctx = self.pre.build_context(slab)
+            primitives = self.builder.build(slab, ctx)
+            out = sampler.sample(slab=slab, adsorbate=ads, primitives=primitives, surface_atom_ids=ctx.detection.surface_atom_ids)
+            self.assertEqual(len({int(p.primitive_index) for p in out}), expected_n_sites)
+
+    def test_linear_adsorbate_site_oriented_quaternions_include_surface_normal(self):
+        ads = molecule("CO")
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=2))
+        quats = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="diatomic",
+            rng=np.random.default_rng(0),
+            n_rot=2,
+        )
+        self.assertEqual(len(quats), 2)
+        vectors = []
+        for q in quats:
+            rotated = sampler._rotated_adsorbate(ads, q)
+            axis = sampler._principal_axis(rotated)
+            self.assertIsNotNone(axis)
+            self.assertGreater(abs(float(np.dot(axis, np.array([0.0, 0.0, 1.0], dtype=float)))), 1.0 - 1e-6)
+            vec = np.asarray(rotated.positions[1] - rotated.positions[0], dtype=float)
+            vec = vec / (np.linalg.norm(vec) + 1e-12)
+            vectors.append(vec)
+        self.assertLess(float(np.dot(vectors[0], vectors[1])), -1.0 + 1e-6)
+
+    def test_select_adsorption_origin_prefers_carbon_end_for_co(self):
+        ads = molecule("CO")
+        if ads[0].symbol != "C":
+            ads = ads[[1, 0]]
+        self.assertEqual(PoseSampler._select_adsorption_origin_index(ads), 0)
+
+    def test_pose_sampler_anchor_free_places_adsorbate_center_on_site_centerline(self):
+        slab = fcc110("Pt", size=(4, 4, 4), vacuum=12.0)
+        ctx = self.pre.build_context(slab)
+        primitives = self.builder.build(slab, ctx)
+        ads = molecule("CO")
+        if ads[0].symbol != "C":
+            ads = ads[[1, 0]]
+        cfg = PoseSamplerConfig(
+            n_rotations=2,
+            n_azimuth=2,
+            n_shifts=1,
+            shift_radius=0.0,
+            min_height=1.2,
+            max_height=3.2,
+            height_step=0.1,
+            placement_mode="anchor_free",
+            max_poses_per_site=8,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+        )
+        out = PoseSampler(cfg).sample(slab=slab, adsorbate=ads, primitives=[primitives[3]], surface_atom_ids=ctx.detection.surface_atom_ids)
+        self.assertGreater(len(out), 0)
+        primitive = primitives[3]
+        found = False
+        for cand in out:
+            offset = np.asarray(cand.com, dtype=float) - np.asarray(primitive.center, dtype=float)
+            lateral = offset - float(np.dot(offset, primitive.normal)) * np.asarray(primitive.normal, dtype=float)
+            if np.linalg.norm(lateral) < 1e-6:
+                found = True
+                break
+        self.assertTrue(found)
+
+    def test_pose_sampler_anchoraware_places_selected_origin_atom_on_site_centerline(self):
+        slab = fcc110("Pt", size=(4, 4, 4), vacuum=12.0)
+        ctx = self.pre.build_context(slab)
+        primitives = self.builder.build(slab, ctx)
+        ads = molecule("CO")
+        if ads[0].symbol != "C":
+            ads = ads[[1, 0]]
+        cfg = PoseSamplerConfig(
+            placement_mode="anchor_aware",
+            n_rotations=2,
+            n_azimuth=2,
+            n_shifts=1,
+            shift_radius=0.0,
+            min_height=1.2,
+            max_height=3.2,
+            height_step=0.1,
+            max_poses_per_site=8,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+        )
+        out = PoseSampler(cfg).sample(slab=slab, adsorbate=ads, primitives=[primitives[3]], surface_atom_ids=ctx.detection.surface_atom_ids)
+        self.assertGreater(len(out), 0)
+        primitive = primitives[3]
+        origin = PoseSampler._select_adsorption_origin_index(ads)
+        found = False
+        for cand in out:
+            c_pos = np.asarray(cand.atoms.positions[int(origin)], dtype=float)
+            offset = c_pos - np.asarray(primitive.center, dtype=float)
+            lateral = offset - float(np.dot(offset, primitive.normal)) * np.asarray(primitive.normal, dtype=float)
+            if np.linalg.norm(lateral) < 1e-6:
+                found = True
+                break
+        self.assertTrue(found)
+
+    def test_anchor_free_centering_uses_center_of_mass_by_default(self):
+        ads = molecule("NH3")
+        sampler = PoseSampler(PoseSamplerConfig(placement_mode="anchor_free", anchor_free_reference="center_of_mass"))
+        centered = sampler._center_adsorbate_for_sampling(ads)
+        mass_center = np.average(centered, axis=0, weights=ads.get_masses())
+        self.assertTrue(np.allclose(mass_center, np.zeros(3), atol=1e-10))
+
+    def test_anchoraware_centering_keeps_selected_origin_at_zero(self):
+        ads = molecule("CO")
+        if ads[0].symbol != "C":
+            ads = ads[[1, 0]]
+        sampler = PoseSampler(PoseSamplerConfig(placement_mode="anchor_aware"))
+        centered = sampler._center_adsorbate_for_sampling(ads)
+        origin = PoseSampler._select_adsorption_origin_index(ads)
+        self.assertTrue(np.allclose(centered[int(origin)], np.zeros(3), atol=1e-12))
+
+    def test_linear_multicenter_sites_use_conservative_height_floor(self):
+        slab = fcc110("Pt", size=(4, 4, 4), vacuum=12.0)
+        ctx = self.pre.build_context(slab)
+        primitives = self.builder.build(slab, ctx)
+        ads = molecule("CO")
+        if ads[0].symbol != "C":
+            ads = ads[[1, 0]]
+        cfg = PoseSamplerConfig(
+            n_rotations=2,
+            n_azimuth=2,
+            n_shifts=1,
+            shift_radius=0.0,
+            min_height=1.2,
+            max_height=3.2,
+            height_step=0.1,
+            max_poses_per_site=8,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+        )
+        out = PoseSampler(cfg).sample(slab=slab, adsorbate=ads, primitives=[primitives[3]], surface_atom_ids=ctx.detection.surface_atom_ids)
+        self.assertGreater(len(out), 0)
+        self.assertGreaterEqual(min(float(p.height) for p in out), 1.45 - 1e-8)
 
     def test_pose_sampler_supports_height_shift_sampling(self):
         slab, ads, surface_ids, primitives = self._prepare_inputs()

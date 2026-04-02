@@ -71,3 +71,32 @@ class TestBasinDedupMaceNodeL2(unittest.TestCase):
                 node_descriptors=[x0, x1, x2],
             )
             self.assertEqual(len(basins), 1, msg=f"method={method}")
+
+    def test_pure_mace_mode_can_merge_across_signatures(self):
+        slab = fcc111("Pt", size=(2, 2, 3), vacuum=10.0)
+        ads = molecule("CO")
+        frame = slab + ads
+        frames = [frame.copy(), frame.copy()]
+        energies = np.asarray([0.0, 0.1], dtype=float)
+        n = len(frame)
+        d = 4
+        x0 = np.zeros((n, d), dtype=float)
+        x1 = np.zeros((n, d), dtype=float)
+        basins, _ = cluster_by_signature_and_mace_node_l2(
+            frames=frames,
+            energies=energies,
+            slab_n=len(slab),
+            binding_tau=0.0,
+            node_l2_threshold=1e-6,
+            mace_model_path=None,
+            mace_device="cpu",
+            mace_dtype="float32",
+            mace_max_edges_per_batch=1000,
+            mace_layers_to_keep=-1,
+            mace_head_name=None,
+            mace_mlp_energy_key=None,
+            node_descriptors=[x0, x1],
+            signature_mode="absolute",
+            use_signature_grouping=False,
+        )
+        self.assertEqual(len(basins), 1)

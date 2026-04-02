@@ -12,6 +12,7 @@ from adsorption_ensemble.basin.dedup import (
     cluster_by_signature_and_rmsd,
     cluster_by_signature_only,
 )
+from adsorption_ensemble.selection import apply_stage_selection, stage_selection_summary
 from adsorption_ensemble.basin.types import Basin, BasinConfig, BasinResult, RejectedCandidate
 from adsorption_ensemble.relax.backends import IdentityRelaxBackend
 
@@ -89,6 +90,39 @@ class BasinBuilder:
             window_keep.append(a)
             window_energies.append(e)
             window_map_ids.append(int(kept_ids[j]))
+        post_relax_diag = {
+            "enabled": False,
+            "strategy": "none",
+            "n_input": int(len(window_keep)),
+            "n_selected": int(len(window_keep)),
+            "selected_ids": list(range(len(window_keep))),
+        }
+        if window_keep and cfg.post_relax_selection is not None and bool(cfg.post_relax_selection.enabled):
+            post_relax_selected_ids, post_relax_diag = apply_stage_selection(
+                frames=window_keep,
+                config=cfg.post_relax_selection,
+                slab_n=int(slab_n),
+                energies=np.asarray(window_energies, dtype=float),
+            )
+            window_keep = [window_keep[i] for i in post_relax_selected_ids]
+            window_energies = [window_energies[i] for i in post_relax_selected_ids]
+            window_map_ids = [window_map_ids[i] for i in post_relax_selected_ids]
+            if work_dir is not None:
+                try:
+                    from ase.io import write
+
+                    write((work_dir / "post_relax_selected.extxyz").as_posix(), window_keep)
+                except Exception:
+                    pass
+                try:
+                    import json
+
+                    (work_dir / "post_relax_selection.json").write_text(
+                        json.dumps(post_relax_diag, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
         dedup_metric = str(cfg.dedup_metric).strip().lower()
         if dedup_metric in {"signature", "signature_only"}:
             basins_raw = cluster_by_signature_only(
@@ -96,6 +130,33 @@ class BasinBuilder:
                 energies=np.asarray(window_energies, dtype=float),
                 slab_n=int(slab_n),
                 binding_tau=float(cfg.binding_tau),
+                signature_mode=str(cfg.signature_mode),
+            )
+        elif dedup_metric in {"rmsd"}:
+            basins_raw = cluster_by_signature_and_rmsd(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+                rmsd_threshold=float(cfg.rmsd_threshold),
+                cluster_method=str(cfg.dedup_cluster_method),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                signature_mode=str(cfg.signature_mode),
+                use_signature_grouping=True,
+            )
+        elif dedup_metric in {"pure_rmsd", "rmsd_only"}:
+            basins_raw = cluster_by_signature_and_rmsd(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+                rmsd_threshold=float(cfg.rmsd_threshold),
+                cluster_method=str(cfg.dedup_cluster_method),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                signature_mode=str(cfg.signature_mode),
+                use_signature_grouping=False,
             )
         else:
             basins_raw = cluster_by_signature_and_rmsd(
@@ -107,6 +168,8 @@ class BasinBuilder:
                 cluster_method=str(cfg.dedup_cluster_method),
                 fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                signature_mode=str(cfg.signature_mode),
+                use_signature_grouping=True,
             )
         dedup_meta: dict = {}
         if dedup_metric in {"mace", "mace_node_l2", "mace_l2"}:
@@ -127,6 +190,29 @@ class BasinBuilder:
                 l2_mode=str(cfg.mace_node_l2_mode),
                 fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                signature_mode=str(cfg.signature_mode),
+                use_signature_grouping=True,
+            )
+        if dedup_metric in {"pure_mace", "pure_mace_l2", "mace_only"}:
+            basins_raw, dedup_meta = cluster_by_signature_and_mace_node_l2(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+                node_l2_threshold=float(cfg.mace_node_l2_threshold),
+                mace_model_path=cfg.mace_model_path,
+                mace_device=str(cfg.mace_device),
+                mace_dtype=str(cfg.mace_dtype),
+                mace_max_edges_per_batch=int(cfg.mace_max_edges_per_batch),
+                mace_layers_to_keep=int(cfg.mace_layers_to_keep),
+                mace_head_name=cfg.mace_head_name,
+                mace_mlp_energy_key=cfg.mace_mlp_energy_key,
+                cluster_method=str(cfg.dedup_cluster_method),
+                l2_mode=str(cfg.mace_node_l2_mode),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                signature_mode=str(cfg.signature_mode),
+                use_signature_grouping=False,
             )
         basins: list[Basin] = []
         for b in basins_raw:
@@ -152,6 +238,9 @@ class BasinBuilder:
             "n_basins": int(len(basins)),
             "energy_min_ev": None if not np.isfinite(e0) else float(e0),
             "dedup_metric": str(cfg.dedup_metric),
+            "post_relax_selection": stage_selection_summary(cfg.post_relax_selection),
+            "post_relax_selection_diagnostics": dict(post_relax_diag),
+            "signature_mode": str(cfg.signature_mode),
             "dedup_cluster_method": str(cfg.dedup_cluster_method),
             "dedup_meta": dict(dedup_meta),
         }

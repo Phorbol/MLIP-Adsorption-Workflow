@@ -22,6 +22,7 @@ class SitePrimitive:
     topo_hash: str
     basis_id: int | None = None
     embedding: np.ndarray | None = None
+    site_label: str | None = None
 
 
 class PrimitiveEnumerator:
@@ -184,6 +185,7 @@ class PrimitiveBuilder:
                         t1=t1,
                         t2=t2,
                         topo_hash=topo_hash,
+                        site_label=None,
                     )
                 )
         primitives = self._prune_by_geometry(
@@ -240,6 +242,7 @@ class PrimitiveBuilder:
                     t1=t1,
                     t2=t2,
                     topo_hash=topo_hash,
+                    site_label=str(name).lower(),
                 )
             )
         if not out:

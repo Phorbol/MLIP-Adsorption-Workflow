@@ -1,3 +1,4 @@
+from .schedule import StageSelectionConfig, apply_stage_selection, stage_selection_summary
 from .strategies import (
     ConvergenceState,
     DualThresholdSelector,
@@ -10,6 +11,9 @@ from .strategies import (
 )
 
 __all__ = [
+    "StageSelectionConfig",
+    "apply_stage_selection",
+    "stage_selection_summary",
     "ConvergenceState",
     "EnergyWindowFilter",
     "RMSDSelector",

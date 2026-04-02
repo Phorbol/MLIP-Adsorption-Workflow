@@ -1,29 +1,40 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 
 def main() -> int:
-    src = Path("artifacts/autoresearch/final_basin_crosslib/autoadsorbate_final_basin_benchmark.json")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", type=str, default="artifacts/autoresearch/final_basin_crosslib/autoadsorbate_final_basin_benchmark.json")
+    parser.add_argument("--out", type=str, default="artifacts/autoresearch/paper_positioning/crosslib_final_basin_report.md")
+    args = parser.parse_args()
+
+    src = Path(args.src)
     payload = json.loads(src.read_text(encoding="utf-8"))
     rows = payload["rows"]
 
     total_ours = sum(int(r["ours"]["n_basins"]) for r in rows)
     total_auto = sum(int(r["autoadsorbate"]["n_basins"]) for r in rows)
+    total_ours_pose = sum(int(r["ours"].get("n_pose_frames", 0)) for r in rows)
+    total_ours_selected = sum(int(r["ours"].get("n_pose_frames_selected_for_basin", r["ours"].get("n_pose_frames", 0))) for r in rows)
     total_auto_attempted = sum(int(r["autoadsorbate"]["generator"]["n_attempted"]) for r in rows)
     total_auto_accepted = sum(int(r["autoadsorbate"]["generator"]["n_accepted"]) for r in rows)
     total_auto_rejected = sum(int(r["autoadsorbate"]["basin_summary"]["n_rejected"]) for r in rows)
 
-    out_dir = Path("artifacts/autoresearch/paper_positioning")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "crosslib_final_basin_report.md"
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# Cross-Library Final Basin Report",
         "",
         "## Summary",
         "",
         f"- Cases: {len(rows)}",
+        f"- Schedule preset: {payload.get('schedule_preset', '')}",
+        f"- Schedule name: {payload.get('schedule_name', '')}",
+        f"- Ours pose pool size before selection: {total_ours_pose}",
+        f"- Ours poses selected for relax/basin stage: {total_ours_selected}",
         f"- Ours total final basins: {total_ours}",
         f"- AutoAdsorbate total final basins after common relax/filter: {total_auto}",
         f"- AutoAdsorbate generated candidates: {total_auto_accepted}/{total_auto_attempted} accepted before relax",
@@ -35,7 +46,7 @@ def main() -> int:
     for r in rows:
         lines.extend(
             [
-                f"- {r['case']}: ours {r['ours']['n_basins']} basins; autoadsorbate {r['autoadsorbate']['n_basins']} basins; "
+                f"- {r['case']}: ours {r['ours']['n_basins']} basins from {r['ours'].get('n_pose_frames_selected_for_basin', r['ours'].get('n_pose_frames', 0))}/{r['ours'].get('n_pose_frames', 0)} selected/raw poses; autoadsorbate {r['autoadsorbate']['n_basins']} basins; "
                 f"accepted candidates {r['autoadsorbate']['generator']['n_accepted']}/{r['autoadsorbate']['generator']['n_attempted']}; "
                 f"rejected reasons {r['autoadsorbate'].get('rejected_reason_counts', {})}",
             ]

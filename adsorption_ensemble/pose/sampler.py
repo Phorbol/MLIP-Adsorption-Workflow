@@ -14,9 +14,26 @@ import itertools
 
 from adsorption_ensemble.site.primitives import SitePrimitive
 
+_PAULING_ELECTRONEGATIVITY = {
+    1: 2.20,
+    5: 2.04,
+    6: 2.55,
+    7: 3.04,
+    8: 3.44,
+    9: 3.98,
+    14: 1.90,
+    15: 2.19,
+    16: 2.58,
+    17: 3.16,
+    35: 2.96,
+    53: 2.66,
+}
+
 
 @dataclass
 class PoseSamplerConfig:
+    placement_mode: str = "anchor_free"
+    anchor_free_reference: str = "center_of_mass"
     n_rotations: int = 12
     n_azimuth: int = 12
     n_shifts: int = 4
@@ -118,12 +135,11 @@ class PoseSampler:
         mol_class = self._classify_molecule_shape(adsorbate)
         n_rot, n_az, n_shift = self._effective_sampling_budget(mol_class)
         rng = np.random.default_rng(self.config.random_seed)
-        quat_list = [self._sample_uniform_quaternion(rng) for _ in range(n_rot)]
         azimuth_list = self._sample_azimuth_angles(n_az)
         shift_list = self._sample_tangent_shifts(rng, n_shift, self.config.shift_radius)
         height_shift_list = self._sample_height_shifts(int(self.config.n_height_shifts), float(self.config.height_shift_step))
         ads_base = adsorbate.copy()
-        ads_base.positions = ads_base.positions - ads_base.get_center_of_mass()
+        ads_base.positions = self._center_adsorbate_for_sampling(adsorbate)
         self._cell = np.asarray(slab.cell.array, dtype=float)
         self._pbc = np.asarray(slab.get_pbc(), dtype=bool)
         try:
@@ -156,6 +172,13 @@ class PoseSampler:
             site_ids_local = self._map_site_atom_ids_to_surface(primitive.atom_ids)
             if site_ids_local is None:
                 continue
+            quat_list = self._build_site_oriented_quaternions(
+                adsorbate_centered=ads_base,
+                normal=primitive.normal,
+                mol_class=mol_class,
+                rng=rng,
+                n_rot=n_rot,
+            )
             for shift_uv in shift_list:
                 center = primitive.center + shift_uv[0] * primitive.t1 + shift_uv[1] * primitive.t2
                 for ridx, quat in enumerate(quat_list):
@@ -251,6 +274,20 @@ class PoseSampler:
         self._mic_vrvecs = None
         return kept
 
+    def _center_adsorbate_for_sampling(self, adsorbate: Atoms) -> np.ndarray:
+        ads = adsorbate.copy()
+        mode = str(getattr(self.config, "placement_mode", "anchor_free")).strip().lower()
+        if mode in {"anchor", "anchor_aware", "origin_atom"}:
+            origin_index = self._select_adsorption_origin_index(adsorbate)
+            return np.asarray(ads.positions, dtype=float) - np.asarray(ads.positions[int(origin_index)], dtype=float)
+        ref_mode = str(getattr(self.config, "anchor_free_reference", "center_of_mass")).strip().lower()
+        pos = np.asarray(ads.positions, dtype=float)
+        if ref_mode in {"geom", "geometry", "geometric_center", "centroid"}:
+            ref = np.mean(pos, axis=0, keepdims=False)
+        else:
+            ref = np.asarray(ads.get_center_of_mass(), dtype=float)
+        return pos - np.asarray(ref, dtype=float)
+
     def _solve_height(
         self,
         slab: Atoms,
@@ -260,7 +297,7 @@ class PoseSampler:
         mol_class: str,
         site_ids_local: list[int],
     ) -> float | None:
-        lo = float(self.config.min_height)
+        lo = float(max(self.config.min_height, self._preferred_min_height(mol_class=mol_class, site_coordination=len(site_ids_local))))
         hi = float(self.config.max_height)
         step = float(max(1e-4, self.config.height_step))
         extra_tol = 0.0
@@ -270,11 +307,12 @@ class PoseSampler:
             extra_tol = float(self.config.linear_contact_extra_tolerance)
         for tau in self.config.height_taus:
             target_tau = float(max(tau, self.config.clash_tau))
+            enforce_contact_window = len(site_ids_local) < 3
             probe_height = lo
             safe_height: float | None = None
             clash_height = lo - step
             while probe_height <= hi + 1e-12:
-                ok, min_site, _ = self._check_height_constraints(
+                ok, min_site, min_surface = self._check_height_constraints(
                     ads_positions=ads_positions,
                     center=center,
                     normal=normal,
@@ -286,9 +324,17 @@ class PoseSampler:
                     clash_height = probe_height
                     probe_height += step
                     continue
+                if probe_height <= lo + 1e-12:
+                    return float(probe_height)
                 safe_height = probe_height
-                if min_site > target_tau + self.config.site_contact_tolerance + extra_tol:
-                    safe_height = None
+                if enforce_contact_window:
+                    contact_metric = self._site_contact_metric(
+                        min_site=min_site,
+                        min_surface=min_surface,
+                        site_ids_local=site_ids_local,
+                    )
+                    if contact_metric > target_tau + self.config.site_contact_tolerance + extra_tol:
+                        safe_height = None
                 break
             if safe_height is None:
                 continue
@@ -308,7 +354,7 @@ class PoseSampler:
                     high = mid
                 else:
                     low = mid
-            _, min_site, _ = self._check_height_constraints(
+            _, min_site, min_surface = self._check_height_constraints(
                 ads_positions=ads_positions,
                 center=center,
                 normal=normal,
@@ -316,9 +362,39 @@ class PoseSampler:
                 target_tau=target_tau,
                 site_ids_local=site_ids_local,
             )
-            if min_site <= target_tau + self.config.site_contact_tolerance + extra_tol:
+            if not enforce_contact_window:
+                return float(high)
+            contact_metric = self._site_contact_metric(
+                min_site=min_site,
+                min_surface=min_surface,
+                site_ids_local=site_ids_local,
+            )
+            if contact_metric <= target_tau + self.config.site_contact_tolerance + extra_tol:
                 return float(high)
         return None
+
+    @staticmethod
+    def _preferred_min_height(mol_class: str, site_coordination: int) -> float:
+        # Linear adsorbates are more sensitive to overly low initial heights on
+        # bridge/hollow sites. Use a conservative floor so relaxations do not
+        # immediately collapse into a neighboring lower-coordination basin.
+        if mol_class not in {"diatomic", "linear"}:
+            return 0.0
+        coord = max(1, int(site_coordination))
+        if coord <= 1:
+            return 1.75
+        if coord == 2:
+            return 1.55
+        return 1.45
+
+    @staticmethod
+    def _site_contact_metric(min_site: float, min_surface: float, site_ids_local: list[int]) -> float:
+        # Multi-center sites such as 3c/4c hollows should be judged by the closest
+        # surface contact at the site center, not by forcing one specific site atom
+        # to sit at a top-like distance.
+        if len(site_ids_local) >= 3:
+            return float(min_surface)
+        return float(min_site)
 
     def _check_height_constraints(
         self,
@@ -796,6 +872,75 @@ class PoseSampler:
         return n_rot, n_az, n_shift
 
     @staticmethod
+    def _select_adsorption_origin_index(adsorbate: Atoms) -> int:
+        n = int(len(adsorbate))
+        if n <= 1:
+            return 0
+        adj = PoseSampler._build_bond_adjacency(adsorbate)
+        degrees = [len(v) for v in adj]
+        terminal = [i for i, deg in enumerate(degrees) if int(deg) <= 1]
+        candidates = terminal or list(range(n))
+        z = np.asarray(adsorbate.get_atomic_numbers(), dtype=int)
+        pos = np.asarray(adsorbate.get_positions(), dtype=float)
+        center = np.mean(pos, axis=0)
+
+        def score(i: int) -> tuple[float, float, float, int]:
+            zi = int(z[i])
+            en = float(_PAULING_ELECTRONEGATIVITY.get(zi, 10.0))
+            radial = float(np.linalg.norm(pos[i] - center))
+            return (en, -radial, float(covalent_radii[zi]), int(i))
+
+        best = min(candidates, key=score)
+        return int(best)
+
+    @staticmethod
+    def _build_bond_adjacency(adsorbate: Atoms, bond_tau: float = 1.20) -> list[set[int]]:
+        n = int(len(adsorbate))
+        adj: list[set[int]] = [set() for _ in range(n)]
+        if n <= 1:
+            return adj
+        z = np.asarray(adsorbate.get_atomic_numbers(), dtype=int)
+        d = np.asarray(adsorbate.get_all_distances(mic=False), dtype=float)
+        for i in range(n):
+            ri = float(covalent_radii[int(z[i])])
+            for j in range(i + 1, n):
+                rj = float(covalent_radii[int(z[j])])
+                if float(d[i, j]) <= float(bond_tau) * (ri + rj):
+                    adj[i].add(j)
+                    adj[j].add(i)
+        return adj
+
+    def _build_site_oriented_quaternions(
+        self,
+        adsorbate_centered: Atoms,
+        normal: np.ndarray,
+        mol_class: str,
+        rng: np.random.Generator,
+        n_rot: int,
+    ) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        if mol_class in {"diatomic", "linear"}:
+            axis = self._principal_axis(adsorbate_centered)
+            if axis is not None:
+                for target in (np.asarray(normal, dtype=float), -np.asarray(normal, dtype=float)):
+                    q = self._quaternion_from_two_vectors(axis, target)
+                    if q is not None:
+                        self._append_unique_quaternion(out, q)
+                        if len(out) >= n_rot:
+                            return out[:n_rot]
+        while len(out) < n_rot:
+            self._append_unique_quaternion(out, self._sample_uniform_quaternion(rng))
+        return out[:n_rot]
+
+    def _append_unique_quaternion(self, acc: list[np.ndarray], quat: np.ndarray, tol: float = 1e-6) -> None:
+        q = np.asarray(quat, dtype=float)
+        q = q / (np.linalg.norm(q) + 1e-12)
+        for ref in acc:
+            if self._quaternion_distance(q, ref) <= float(tol):
+                return
+        acc.append(q)
+
+    @staticmethod
     def _estimate_tilt_deg(adsorbate_centered: Atoms, normal: np.ndarray) -> float:
         axis = PoseSampler._principal_axis(adsorbate_centered)
         n = np.asarray(normal, dtype=float)
@@ -823,6 +968,30 @@ class PoseSampler:
         if n < 1e-12:
             return None
         return axis / n
+
+    @staticmethod
+    def _quaternion_from_two_vectors(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray | None:
+        a = np.asarray(v_from, dtype=float)
+        b = np.asarray(v_to, dtype=float)
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        if na < 1e-12 or nb < 1e-12:
+            return None
+        a = a / na
+        b = b / nb
+        dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+        if dot > 1.0 - 1e-10:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        if dot < -1.0 + 1e-10:
+            ref = np.array([1.0, 0.0, 0.0], dtype=float)
+            if abs(float(np.dot(a, ref))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0], dtype=float)
+            axis = np.cross(a, ref)
+            axis = axis / (np.linalg.norm(axis) + 1e-12)
+            return np.array([axis[0], axis[1], axis[2], 0.0], dtype=float)
+        axis = np.cross(a, b)
+        q = np.array([axis[0], axis[1], axis[2], 1.0 + dot], dtype=float)
+        return q / (np.linalg.norm(q) + 1e-12)
 
     @staticmethod
     def _classify_molecule_shape(adsorbate: Atoms) -> str:

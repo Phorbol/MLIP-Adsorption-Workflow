@@ -10,11 +10,8 @@ from ase.build import fcc211, molecule
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adsorption_ensemble.basin import BasinConfig
 from adsorption_ensemble.conformer_md import ConformerMDSampler, ConformerMDSamplerConfig, GeometryPairDistanceDescriptor, read_molecule_any
-from adsorption_ensemble.node import NodeConfig
-from adsorption_ensemble.pose import PoseSamplerConfig
-from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, evaluate_adsorption_workflow_readiness, run_adsorption_workflow
+from adsorption_ensemble.workflows import generate_adsorption_ensemble, make_sampling_schedule
 
 
 class FakeMDRunner:
@@ -52,55 +49,56 @@ def run_adsorption_api_example(
     slab = fcc211("Pt", size=(6, 4, 4), vacuum=12.0)
     ads = molecule("CO")
     want_mace = bool(use_mace_dedup) and bool(mace_model_path) and Path(str(mace_model_path)).exists()
-    cfg = AdsorptionWorkflowConfig(
+    result = generate_adsorption_ensemble(
+        slab=slab,
+        adsorbate=ads,
         work_dir=out,
-        pose_sampler_config=PoseSamplerConfig(
-            n_rotations=2,
-            n_azimuth=6,
-            n_shifts=1,
-            shift_radius=0.0,
-            min_height=1.6,
-            max_height=2.6,
-            height_step=0.2,
-            random_seed=0,
-            max_poses_per_site=4,
-        ),
-        basin_config=BasinConfig(
-            relax_maxf=0.10,
-            relax_steps=2,
-            energy_window_ev=1.0,
-            dedup_metric=("mace_node_l2" if want_mace else "rmsd"),
-            rmsd_threshold=0.10,
-            mace_node_l2_threshold=2.0,
-            mace_model_path=(str(mace_model_path) if want_mace else None),
-            mace_device=str(mace_device),
-            mace_dtype=str(mace_dtype),
-            binding_tau=1.15,
-            desorption_min_bonds=0,
-            work_dir=out / "basin_work",
-        ),
-        node_config=NodeConfig(bond_tau=1.20, node_hash_len=20),
-        max_primitives=4,
+        placement_mode="anchor_free",
+        schedule=make_sampling_schedule("multistage_default"),
+        dedup_metric=("mace_node_l2" if want_mace else "rmsd"),
+        signature_mode="provenance",
+        pose_overrides={
+            "n_rotations": 2,
+            "n_azimuth": 6,
+            "n_shifts": 1,
+            "shift_radius": 0.0,
+            "min_height": 1.6,
+            "max_height": 2.6,
+            "height_step": 0.2,
+            "random_seed": 0,
+            "max_poses_per_site": 4,
+        },
+        basin_overrides={
+            "relax_maxf": 0.10,
+            "relax_steps": 2,
+            "energy_window_ev": 1.0,
+            "rmsd_threshold": 0.10,
+            "mace_node_l2_threshold": 2.0,
+            "mace_model_path": (str(mace_model_path) if want_mace else None),
+            "mace_device": str(mace_device),
+            "mace_dtype": str(mace_dtype),
+            "binding_tau": 1.15,
+            "desorption_min_bonds": 1,
+        },
     )
-    result = run_adsorption_workflow(slab=slab, adsorbate=ads, config=cfg)
-    readiness = evaluate_adsorption_workflow_readiness(result)
     return {
         "out_dir": out.as_posix(),
-        "n_primitives": int(result.summary["n_primitives"]),
+        "n_primitives": int(result.workflow.summary["n_primitives"]),
         "n_poses": int(result.summary["n_pose_frames"]),
         "n_basins": int(result.summary["n_basins"]),
         "n_nodes": int(result.summary["n_nodes"]),
         "dedup_metric_requested": ("mace_node_l2" if use_mace_dedup else "rmsd"),
-        "dedup_metric": str(cfg.basin_config.dedup_metric),
-        "paper_readiness_score": int(readiness.score),
-        "paper_readiness_max_score": int(readiness.max_score),
+        "dedup_metric": str(result.summary["dedup_metric"]),
+        "schedule_name": str(result.summary["schedule"]["name"]),
+        "paper_readiness_score": int(result.readiness.score),
+        "paper_readiness_max_score": int(result.readiness.max_score),
         "files": {
-            "pose_pool": result.artifacts.get("pose_pool_extxyz", ""),
-            "basins_extxyz": result.artifacts.get("basins_extxyz", ""),
-            "basins_json": result.artifacts.get("basins_json", ""),
-            "nodes_json": result.artifacts.get("nodes_json", ""),
-            "site_dictionary_json": result.artifacts.get("site_dictionary_json", ""),
-            "workflow_summary_json": result.artifacts.get("workflow_summary_json", ""),
+            "pose_pool": result.files.get("pose_pool_extxyz", ""),
+            "basins_extxyz": result.files.get("basins_extxyz", ""),
+            "basins_json": result.files.get("basins_json", ""),
+            "nodes_json": result.files.get("nodes_json", ""),
+            "site_dictionary_json": result.files.get("site_dictionary_json", ""),
+            "workflow_summary_json": result.files.get("workflow_summary_json", ""),
         },
     }
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
+import math
 from collections import defaultdict
 from typing import Callable
 
 import numpy as np
 from ase import Atoms
 from ase.data import covalent_radii
+from scipy.optimize import linear_sum_assignment
 
 
 def build_adsorbate_bonds(adsorbate: Atoms, bond_tau: float = 1.20) -> set[tuple[int, int]]:
@@ -25,14 +28,24 @@ def build_adsorbate_bonds(adsorbate: Atoms, bond_tau: float = 1.20) -> set[tuple
     return bonds
 
 
-def build_binding_pairs(frame: Atoms, slab_n: int, binding_tau: float) -> list[tuple[int, int]]:
+def build_binding_pairs(
+    frame: Atoms,
+    slab_n: int,
+    binding_tau: float,
+    *,
+    ignore_h_when_heavy_present: bool = True,
+) -> list[tuple[int, int]]:
     n = len(frame)
     if slab_n <= 0 or slab_n >= n:
         return []
     z = np.asarray(frame.get_atomic_numbers(), dtype=int)
     d = frame.get_all_distances(mic=True)
+    ads_z = np.asarray(z[slab_n:], dtype=int)
+    has_heavy_adsorbate_atom = bool(np.any(ads_z != 1))
     pairs: list[tuple[int, int]] = []
     for ai in range(slab_n, n):
+        if bool(ignore_h_when_heavy_present) and has_heavy_adsorbate_atom and int(z[ai]) == 1:
+            continue
         ra = float(covalent_radii[int(z[ai])])
         for sj in range(0, slab_n):
             rs = float(covalent_radii[int(z[sj])])
@@ -41,8 +54,50 @@ def build_binding_pairs(frame: Atoms, slab_n: int, binding_tau: float) -> list[t
     return sorted(set(pairs))
 
 
-def binding_signature(binding_pairs: list[tuple[int, int]]) -> str:
-    payload = ",".join([f"{i}:{j}" for i, j in binding_pairs]).encode("utf-8")
+def _surface_atom_environment_signature(frame: Atoms, slab_n: int, slab_atom_index: int, k: int = 6) -> str:
+    if slab_n <= 1:
+        return f"s{int(slab_atom_index)}"
+    z = np.asarray(frame.get_atomic_numbers(), dtype=int)
+    sym = int(z[int(slab_atom_index)])
+    d = np.asarray(frame.get_distances(int(slab_atom_index), list(range(slab_n)), mic=True), dtype=float).reshape(-1)
+    d = np.sort(d[d > 1e-8])
+    take = d[: max(0, int(k))]
+    rounded = ",".join(f"{float(v):.3f}" for v in take.tolist())
+    return f"Z{sym}|{rounded}"
+
+
+def binding_signature(
+    binding_pairs: list[tuple[int, int]],
+    *,
+    frame: Atoms | None = None,
+    slab_n: int | None = None,
+    mode: str = "absolute",
+) -> str:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm in {"none", "off", "disabled"}:
+        return "all"
+    if mode_norm in {"provenance", "basis", "site_label"}:
+        if frame is None:
+            raise ValueError("provenance binding_signature requires frame.")
+        tokens = []
+        site_label = str(frame.info.get("site_label", "")).strip()
+        basis_id = frame.info.get("basis_id", None)
+        for i, _ in sorted(binding_pairs):
+            label = site_label if site_label else f"basis={basis_id}"
+            tokens.append(f"{int(i)}:{label}")
+        if not tokens:
+            tokens.append(f"free:{site_label if site_label else f'basis={basis_id}'}")
+        payload = ",".join(tokens).encode("utf-8")
+    elif mode_norm in {"canonical", "equivalent", "site_equivalent"}:
+        if frame is None or slab_n is None:
+            raise ValueError("canonical binding_signature requires frame and slab_n.")
+        tokens = []
+        for i, j in sorted(binding_pairs):
+            env = _surface_atom_environment_signature(frame=frame, slab_n=int(slab_n), slab_atom_index=int(j))
+            tokens.append(f"{int(i)}:{env}")
+        payload = ",".join(tokens).encode("utf-8")
+    else:
+        payload = ",".join([f"{i}:{j}" for i, j in binding_pairs]).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:16]
 
 
@@ -60,6 +115,107 @@ def kabsch_rmsd(p: np.ndarray, q: np.ndarray) -> float:
     pr = pc @ r
     diff = pr - qc
     return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
+
+
+def _wl_atom_classes(adsorbate: Atoms, *, bond_tau: float = 1.20, n_iter: int = 4) -> list[int]:
+    bonds = build_adsorbate_bonds(adsorbate=adsorbate, bond_tau=float(bond_tau))
+    n = len(adsorbate)
+    if n <= 0:
+        return []
+    nbrs: list[list[int]] = [[] for _ in range(n)]
+    for i, j in bonds:
+        nbrs[int(i)].append(int(j))
+        nbrs[int(j)].append(int(i))
+    z = np.asarray(adsorbate.get_atomic_numbers(), dtype=int)
+    labels = [f"Z{int(z[i])}|deg{len(nbrs[i])}" for i in range(n)]
+    for _ in range(max(1, int(n_iter))):
+        new_labels = []
+        for i in range(n):
+            neigh = sorted(labels[j] for j in nbrs[i])
+            new_labels.append(f"{labels[i]}|{'/'.join(neigh)}")
+        labels = new_labels
+    unique = {label: idx for idx, label in enumerate(sorted(set(labels)))}
+    return [int(unique[label]) for label in labels]
+
+
+def _atom_class_groups(adsorbate: Atoms, *, bond_tau: float = 1.20) -> list[list[int]]:
+    classes = _wl_atom_classes(adsorbate=adsorbate, bond_tau=float(bond_tau))
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i, cls in enumerate(classes):
+        groups[int(cls)].append(int(i))
+    return [sorted(v) for _, v in sorted(groups.items(), key=lambda kv: min(kv[1]))]
+
+
+def _permute_positions(pos: np.ndarray, groups: list[list[int]], permuted_groups: list[tuple[int, ...]]) -> np.ndarray:
+    out = np.asarray(pos, dtype=float).copy()
+    for base, perm in zip(groups, permuted_groups):
+        out[np.asarray(base, dtype=int)] = np.asarray(pos, dtype=float)[np.asarray(list(perm), dtype=int)]
+    return out
+
+
+def symmetry_aware_kabsch_rmsd(
+    p: np.ndarray,
+    q: np.ndarray,
+    adsorbate: Atoms,
+    *,
+    bond_tau: float = 1.20,
+    max_exact_permutations: int = 256,
+    approx_iters: int = 3,
+) -> float:
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    if p.shape != q.shape or p.ndim != 2 or p.shape[1] != 3 or len(adsorbate) != p.shape[0]:
+        return float("nan")
+    groups = _atom_class_groups(adsorbate=adsorbate, bond_tau=float(bond_tau))
+    if all(len(g) <= 1 for g in groups):
+        return float(kabsch_rmsd(p, q))
+
+    exact_budget = 1
+    group_perms: list[list[tuple[int, ...]]] = []
+    for g in groups:
+        if len(g) <= 1:
+            perms = [tuple(g)]
+        else:
+            exact_budget *= int(math.factorial(len(g)))
+            perms = list(itertools.permutations(g)) if exact_budget <= int(max_exact_permutations) else []
+        group_perms.append(perms)
+
+    if exact_budget <= int(max_exact_permutations) and all(group_perms):
+        best = float("inf")
+        for permuted_groups in itertools.product(*group_perms):
+            d = float(kabsch_rmsd(_permute_positions(p, groups, list(permuted_groups)), q))
+            if np.isfinite(d) and d < best:
+                best = d
+        return best
+
+    q_centered = q - np.mean(q, axis=0, keepdims=True)
+    perm_indices = np.arange(len(adsorbate), dtype=int)
+    p_perm = np.asarray(p, dtype=float).copy()
+    best = float(kabsch_rmsd(p_perm, q))
+    for _ in range(max(1, int(approx_iters))):
+        p_centered = p_perm - np.mean(p_perm, axis=0, keepdims=True)
+        c = p_centered.T @ q_centered
+        v, _, w = np.linalg.svd(c)
+        d = np.sign(np.linalg.det(v @ w))
+        r = v @ np.diag([1.0, 1.0, float(d)]) @ w
+        p_rot = p_centered @ r
+        next_perm = perm_indices.copy()
+        for g in groups:
+            if len(g) <= 1:
+                continue
+            g_arr = np.asarray(g, dtype=int)
+            cost = np.linalg.norm(
+                p_rot[g_arr][:, None, :] - q_centered[g_arr][None, :, :],
+                axis=2,
+            )
+            row_ind, col_ind = linear_sum_assignment(cost)
+            next_perm[g_arr[row_ind]] = perm_indices[g_arr[col_ind]]
+        if np.array_equal(next_perm, perm_indices):
+            break
+        perm_indices = next_perm
+        p_perm = np.asarray(p, dtype=float)[perm_indices]
+        best = min(best, float(kabsch_rmsd(p_perm, q)))
+    return best
 
 
 def sum_atomwise_l2(a: np.ndarray, b: np.ndarray) -> float:
@@ -198,17 +354,25 @@ def _cluster_group_by_distance(
     return [[group[i] for i in sorted(g)] for g in idx_groups]
 
 
-def _group_items_by_signature(frames: list[Atoms], energies: np.ndarray, slab_n: int, binding_tau: float) -> dict[str, list[dict]]:
+def _group_items_by_signature(
+    frames: list[Atoms],
+    energies: np.ndarray,
+    slab_n: int,
+    binding_tau: float,
+    *,
+    signature_mode: str = "absolute",
+) -> dict[str, list[dict]]:
     items: list[dict] = []
     for i, atoms in enumerate(frames):
         pairs = build_binding_pairs(atoms, slab_n=slab_n, binding_tau=binding_tau)
+        sig = binding_signature(pairs, frame=atoms, slab_n=slab_n, mode=str(signature_mode))
         items.append(
             {
                 "candidate_id": int(i),
                 "atoms": atoms,
                 "energy": float(energies[i]) if i < len(energies) else float("nan"),
                 "binding_pairs": pairs,
-                "signature": binding_signature(pairs),
+                "signature": sig,
             }
         )
     by_sig: dict[str, list[dict]] = {}
@@ -235,6 +399,8 @@ def cluster_by_signature_and_mace_node_l2(
     fuzzy_sigma_scale: float = 1.5,
     fuzzy_membership_cutoff: float = 0.5,
     node_descriptors: list[np.ndarray | None] | None = None,
+    signature_mode: str = "absolute",
+    use_signature_grouping: bool = True,
 ) -> tuple[list[dict], dict]:
     if node_descriptors is None:
         from adsorption_ensemble.conformer_md.config import MACEInferenceConfig
@@ -254,7 +420,18 @@ def cluster_by_signature_and_mace_node_l2(
         node_descriptors, _, meta = infer.infer_node_descriptors(frames)
     else:
         meta = {"provided_node_descriptors": True}
-    by_sig = _group_items_by_signature(frames=frames, energies=energies, slab_n=slab_n, binding_tau=binding_tau)
+    by_sig = _group_items_by_signature(
+        frames=frames,
+        energies=energies,
+        slab_n=slab_n,
+        binding_tau=binding_tau,
+        signature_mode=str(signature_mode),
+    )
+    if not bool(use_signature_grouping):
+        flat = []
+        for group in by_sig.values():
+            flat.extend(group)
+        by_sig = {"all": flat}
     # Inject node descriptors after signature construction to keep logic centralized.
     flat_items = []
     for group in by_sig.values():
@@ -300,6 +477,8 @@ def cluster_by_signature_and_mace_node_l2(
     meta["cluster_method"] = str(cluster_method)
     meta["l2_mode"] = str(l2_mode_norm)
     meta["node_l2_threshold"] = float(node_l2_threshold)
+    meta["signature_mode"] = str(signature_mode)
+    meta["use_signature_grouping"] = bool(use_signature_grouping)
     return basins, meta
 
 
@@ -308,8 +487,15 @@ def cluster_by_signature_only(
     energies: np.ndarray,
     slab_n: int,
     binding_tau: float,
+    signature_mode: str = "absolute",
 ) -> list[dict]:
-    by_sig = _group_items_by_signature(frames=frames, energies=energies, slab_n=slab_n, binding_tau=binding_tau)
+    by_sig = _group_items_by_signature(
+        frames=frames,
+        energies=energies,
+        slab_n=slab_n,
+        binding_tau=binding_tau,
+        signature_mode=str(signature_mode),
+    )
     basins: list[dict] = []
     basin_id = 0
     for sig, group in by_sig.items():
@@ -338,17 +524,31 @@ def cluster_by_signature_and_rmsd(
     cluster_method: str = "greedy",
     fuzzy_sigma_scale: float = 1.5,
     fuzzy_membership_cutoff: float = 0.5,
+    signature_mode: str = "absolute",
+    use_signature_grouping: bool = True,
 ) -> list[dict]:
-    by_sig = _group_items_by_signature(frames=frames, energies=energies, slab_n=slab_n, binding_tau=binding_tau)
+    by_sig = _group_items_by_signature(
+        frames=frames,
+        energies=energies,
+        slab_n=slab_n,
+        binding_tau=binding_tau,
+        signature_mode=str(signature_mode),
+    )
+    if not bool(use_signature_grouping):
+        flat = []
+        for group in by_sig.values():
+            flat.extend(group)
+        by_sig = {"all": flat}
     basins: list[dict] = []
     basin_id = 0
     for sig, group in by_sig.items():
         group = sorted(group, key=lambda x: (np.nan_to_num(x["energy"], nan=np.inf), x["candidate_id"]))
         clusters = _cluster_group_by_distance(
             group=group,
-            distance_fn=lambda a, b: kabsch_rmsd(
+            distance_fn=lambda a, b: symmetry_aware_kabsch_rmsd(
                 np.asarray(a["atoms"].get_positions(), dtype=float)[slab_n:],
                 np.asarray(b["atoms"].get_positions(), dtype=float)[slab_n:],
+                a["atoms"][slab_n:],
             ),
             threshold=float(rmsd_threshold),
             cluster_method=str(cluster_method),
