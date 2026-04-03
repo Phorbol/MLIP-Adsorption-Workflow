@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 from ase.build import fcc111, molecule
 
-from adsorption_ensemble.basin import BasinConfig, build_basin_dictionary, run_basin_ablation
+from adsorption_ensemble.basin import BasinConfig, build_basin_dictionary, run_basin_ablation, run_named_basin_ablation
 from adsorption_ensemble.node import NodeConfig, basin_to_node
 from adsorption_ensemble.pose import PoseSamplerConfig
 from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, run_adsorption_workflow
@@ -88,10 +88,34 @@ class TestBasinReporting(unittest.TestCase):
                 slab_n=len(slab),
                 normal_axis=int(result.surface_context.classification.normal_axis),
                 base_config=cfg.basin_config,
-                metrics=("signature_only", "rmsd", "mace_node_l2"),
+                metrics=("signature_only", "rmsd", "binding_surface_distance", "mace_node_l2"),
             )
             self.assertIn("metrics", ablation)
             self.assertIn("signature_only", ablation["metrics"])
             self.assertIn("rmsd", ablation["metrics"])
+            self.assertIn("binding_surface_distance", ablation["metrics"])
             self.assertIn("mace_node_l2", ablation["metrics"])
             self.assertIn(ablation["metrics"]["mace_node_l2"]["status"], {"ok", "error"})
+
+    def test_run_named_basin_ablation_supports_custom_configs(self):
+        slab = fcc111("Pt", size=(3, 3, 3), vacuum=10.0)
+        ads = molecule("CO")
+        frame = slab + ads
+        out = run_named_basin_ablation(
+            frames=[frame.copy(), frame.copy()],
+            slab_ref=slab,
+            adsorbate_ref=ads,
+            slab_n=len(slab),
+            normal_axis=2,
+            configs={
+                "prov_rmsd": BasinConfig(relax_maxf=0.1, relax_steps=1, energy_window_ev=1.0, dedup_metric="rmsd", signature_mode="provenance", work_dir=None),
+                "binding_surface": BasinConfig(relax_maxf=0.1, relax_steps=1, energy_window_ev=1.0, dedup_metric="binding_surface_distance", signature_mode="provenance", work_dir=None),
+                "pure_rmsd": BasinConfig(relax_maxf=0.1, relax_steps=1, energy_window_ev=1.0, dedup_metric="pure_rmsd", signature_mode="provenance", work_dir=None),
+            },
+        )
+        self.assertIn("prov_rmsd", out["configs"])
+        self.assertIn("binding_surface", out["configs"])
+        self.assertIn("pure_rmsd", out["configs"])
+        self.assertEqual(out["configs"]["prov_rmsd"]["status"], "ok")
+        self.assertEqual(out["configs"]["binding_surface"]["status"], "ok")
+        self.assertEqual(out["configs"]["pure_rmsd"]["status"], "ok")

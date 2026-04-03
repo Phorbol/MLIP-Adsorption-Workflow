@@ -196,6 +196,60 @@ def run_basin_ablation(
     return out
 
 
+def run_named_basin_ablation(
+    *,
+    frames: list[Atoms],
+    slab_ref: Atoms,
+    adsorbate_ref: Atoms,
+    slab_n: int,
+    normal_axis: int,
+    configs: dict[str, BasinConfig],
+    relax_backend: object | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"configs": {}}
+    counts: dict[str, int] = {}
+    for name, cfg in configs.items():
+        try:
+            result = BasinBuilder(config=cfg, relax_backend=relax_backend).build(
+                frames=frames,
+                slab_ref=slab_ref,
+                adsorbate_ref=adsorbate_ref,
+                slab_n=int(slab_n),
+                normal_axis=int(normal_axis),
+            )
+            out["configs"][str(name)] = {
+                "status": "ok",
+                "summary": dict(result.summary),
+                "n_basins": int(len(result.basins)),
+                "n_rejected": int(len(result.rejected)),
+                "basin_sizes": [int(len(b.member_candidate_ids)) for b in result.basins],
+                "basin_signatures": [str(b.signature) for b in result.basins],
+                "basin_dictionary": build_basin_dictionary(result, pose_frames=frames, nodes=None, slab_n=int(slab_n)),
+            }
+            counts[str(name)] = int(len(result.basins))
+        except Exception as exc:
+            out["configs"][str(name)] = {
+                "status": "error",
+                "error_type": str(type(exc).__name__),
+                "error_message": str(exc),
+                "n_basins": 0,
+                "n_rejected": 0,
+                "basin_sizes": [],
+                "basin_signatures": [],
+                "basin_dictionary": {"summary": {}, "basins": [], "rejected": []},
+            }
+            counts[str(name)] = 0
+    if counts:
+        min_name = min(counts, key=counts.get)
+        max_name = max(counts, key=counts.get)
+        out["comparison"] = {
+            "min_basin_config": str(min_name),
+            "max_basin_config": str(max_name),
+            "basin_count_delta": int(counts[max_name] - counts[min_name]),
+        }
+    return out
+
+
 def _member_rmsd_stats(member_frames: list[Atoms], slab_n: int | None) -> dict[str, float | None]:
     if slab_n is None or len(member_frames) <= 1:
         return {"min": None, "max": None, "mean": None}

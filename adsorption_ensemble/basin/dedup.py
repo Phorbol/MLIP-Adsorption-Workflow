@@ -101,6 +101,71 @@ def binding_signature(
     return hashlib.sha1(payload).hexdigest()[:16]
 
 
+def binding_pattern_signature(binding_pairs: list[tuple[int, int]], *, frame: Atoms | None = None, slab_n: int | None = None) -> str:
+    coord_by_adsorbate_atom: dict[int, int] = defaultdict(int)
+    for i, _ in sorted(binding_pairs):
+        coord_by_adsorbate_atom[int(i)] += 1
+    tokens = []
+    for ads_idx, coord in sorted(coord_by_adsorbate_atom.items()):
+        symbol = ""
+        if frame is not None and slab_n is not None:
+            atom_idx = int(slab_n) + int(ads_idx)
+            if 0 <= atom_idx < len(frame):
+                symbol = str(frame[int(atom_idx)].symbol)
+        if symbol:
+            tokens.append(f"{int(ads_idx)}:{symbol}:{int(coord)}")
+        else:
+            tokens.append(f"{int(ads_idx)}:{int(coord)}")
+    if not tokens:
+        tokens.append("free")
+    return hashlib.sha1(",".join(tokens).encode("utf-8")).hexdigest()[:16]
+
+
+def local_binding_surface_descriptor(
+    frame: Atoms,
+    *,
+    slab_n: int,
+    binding_pairs: list[tuple[int, int]],
+    k_nearest: int = 8,
+    atom_mode: str = "binding_only",
+    relative: bool = False,
+) -> np.ndarray:
+    n = len(frame)
+    if int(slab_n) <= 0 or int(slab_n) >= n:
+        return np.empty((0,), dtype=float)
+    mode = str(atom_mode).strip().lower()
+    binding_ads = sorted({int(i) for i, _ in binding_pairs})
+    ads_z = np.asarray(frame.get_atomic_numbers(), dtype=int)[int(slab_n) :]
+    if mode in {"binding_only", "binding_atoms", "bound"}:
+        ads_indices = binding_ads
+    elif mode in {"binding_heavy", "binding_non_h", "bound_heavy"}:
+        ads_indices = [int(i) for i in binding_ads if 0 <= int(i) < len(ads_z) and int(ads_z[int(i)]) != 1]
+        if not ads_indices:
+            ads_indices = binding_ads
+    elif mode in {"all_heavy", "heavy", "non_h"}:
+        ads_indices = [int(i) for i, z in enumerate(ads_z.tolist()) if int(z) != 1]
+        if not ads_indices:
+            ads_indices = list(range(len(ads_z)))
+    elif mode in {"all", "all_atoms", "adsorbate"}:
+        ads_indices = list(range(len(ads_z)))
+    else:
+        raise ValueError(f"Unsupported atom_mode: {atom_mode}")
+    if not ads_indices:
+        return np.empty((0,), dtype=float)
+    dmat = np.asarray(frame.get_all_distances(mic=True), dtype=float)
+    k = max(1, int(k_nearest))
+    feat = []
+    for ai in ads_indices:
+        if int(ai) < 0 or int(ai) >= len(ads_z):
+            continue
+        d = np.sort(np.asarray(dmat[int(slab_n) + int(ai), : int(slab_n)], dtype=float))
+        d = d[: min(k, len(d))]
+        if bool(relative) and d.size:
+            d = d - float(d[0])
+        feat.extend(float(v) for v in d.tolist())
+    return np.asarray(feat, dtype=float)
+
+
 def kabsch_rmsd(p: np.ndarray, q: np.ndarray) -> float:
     p = np.asarray(p, dtype=float)
     q = np.asarray(q, dtype=float)
@@ -379,6 +444,125 @@ def _group_items_by_signature(
     for it in items:
         by_sig.setdefault(str(it["signature"]), []).append(it)
     return by_sig
+
+
+def _group_items_by_binding_pattern(
+    frames: list[Atoms],
+    energies: np.ndarray,
+    slab_n: int,
+    binding_tau: float,
+    *,
+    surface_nearest_k: int,
+    surface_atom_mode: str,
+    surface_relative: bool,
+) -> dict[str, list[dict]]:
+    items: list[dict] = []
+    for i, atoms in enumerate(frames):
+        pairs = build_binding_pairs(atoms, slab_n=slab_n, binding_tau=binding_tau)
+        pattern_sig = binding_pattern_signature(pairs, frame=atoms, slab_n=slab_n)
+        surface_desc = local_binding_surface_descriptor(
+            atoms,
+            slab_n=int(slab_n),
+            binding_pairs=pairs,
+            k_nearest=int(surface_nearest_k),
+            atom_mode=str(surface_atom_mode),
+            relative=bool(surface_relative),
+        )
+        items.append(
+            {
+                "candidate_id": int(i),
+                "atoms": atoms,
+                "energy": float(energies[i]) if i < len(energies) else float("nan"),
+                "binding_pairs": pairs,
+                "binding_pattern_signature": str(pattern_sig),
+                "surface_desc": surface_desc,
+            }
+        )
+    by_sig: dict[str, list[dict]] = {}
+    for it in items:
+        by_sig.setdefault(str(it["binding_pattern_signature"]), []).append(it)
+    return by_sig
+
+
+def _descriptor_signature(pattern_sig: str, surface_desc: np.ndarray | None) -> str:
+    if surface_desc is None:
+        return hashlib.sha1(str(pattern_sig).encode("utf-8")).hexdigest()[:16]
+    desc = np.asarray(surface_desc, dtype=float).reshape(-1)
+    rounded = ",".join(f"{float(v):.3f}" for v in desc.tolist())
+    return hashlib.sha1(f"{pattern_sig}|{rounded}".encode("utf-8")).hexdigest()[:16]
+
+
+def cluster_by_binding_pattern_and_surface_distance(
+    frames: list[Atoms],
+    energies: np.ndarray,
+    slab_n: int,
+    binding_tau: float,
+    surface_distance_threshold: float,
+    surface_nearest_k: int = 8,
+    surface_atom_mode: str = "binding_only",
+    surface_relative: bool = False,
+    surface_rmsd_gate: float | None = None,
+    cluster_method: str = "greedy",
+    fuzzy_sigma_scale: float = 1.5,
+    fuzzy_membership_cutoff: float = 0.5,
+) -> tuple[list[dict], dict]:
+    by_pattern = _group_items_by_binding_pattern(
+        frames=frames,
+        energies=energies,
+        slab_n=slab_n,
+        binding_tau=binding_tau,
+        surface_nearest_k=int(surface_nearest_k),
+        surface_atom_mode=str(surface_atom_mode),
+        surface_relative=bool(surface_relative),
+    )
+    basins: list[dict] = []
+    basin_id = 0
+    for pattern_sig, group in by_pattern.items():
+        group = sorted(group, key=lambda x: (np.nan_to_num(x["energy"], nan=np.inf), x["candidate_id"]))
+
+        def distance_fn(a: dict, b: dict) -> float:
+            da = np.asarray(a.get("surface_desc", np.empty((0,), dtype=float)), dtype=float).reshape(-1)
+            db = np.asarray(b.get("surface_desc", np.empty((0,), dtype=float)), dtype=float).reshape(-1)
+            if da.shape != db.shape:
+                return float("nan")
+            if surface_rmsd_gate is not None and np.isfinite(float(surface_rmsd_gate)):
+                pa = np.asarray(a["atoms"].get_positions(), dtype=float)[int(slab_n) :]
+                pb = np.asarray(b["atoms"].get_positions(), dtype=float)[int(slab_n) :]
+                rr = float(symmetry_aware_kabsch_rmsd(pa, pb, a["atoms"][int(slab_n) :]))
+                if not np.isfinite(rr) or rr > float(surface_rmsd_gate):
+                    return float("inf")
+            return float(np.linalg.norm(da - db))
+
+        clusters = _cluster_group_by_distance(
+            group=group,
+            distance_fn=distance_fn,
+            threshold=float(surface_distance_threshold),
+            cluster_method=str(cluster_method),
+            fuzzy_sigma_scale=float(fuzzy_sigma_scale),
+            fuzzy_membership_cutoff=float(fuzzy_membership_cutoff),
+        )
+        for members in clusters:
+            rep = sorted(members, key=lambda x: (np.nan_to_num(x["energy"], nan=np.inf), x["candidate_id"]))[0]
+            basins.append(
+                {
+                    "basin_id": int(basin_id),
+                    "atoms": rep["atoms"],
+                    "energy": float(rep["energy"]),
+                    "member_candidate_ids": [int(x["candidate_id"]) for x in members],
+                    "binding_pairs": rep["binding_pairs"],
+                    "signature": _descriptor_signature(pattern_sig=str(pattern_sig), surface_desc=rep.get("surface_desc")),
+                }
+            )
+            basin_id += 1
+    meta = {
+        "surface_distance_threshold": float(surface_distance_threshold),
+        "surface_nearest_k": int(surface_nearest_k),
+        "surface_atom_mode": str(surface_atom_mode),
+        "surface_relative": bool(surface_relative),
+        "surface_rmsd_gate": (None if surface_rmsd_gate is None else float(surface_rmsd_gate)),
+        "cluster_method": str(cluster_method),
+    }
+    return basins, meta
 
 
 def cluster_by_signature_and_mace_node_l2(

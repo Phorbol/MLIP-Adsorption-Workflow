@@ -34,6 +34,11 @@ class BasinConfig:
     surface_reconstruction_max_disp: float = 0.50
     dissociation_allow_bond_change: bool = False
     burial_margin: float = 0.30
+    surface_descriptor_threshold: float = 0.30
+    surface_descriptor_nearest_k: int = 8
+    surface_descriptor_atom_mode: str = "binding_only"
+    surface_descriptor_relative: bool = False
+    surface_descriptor_rmsd_gate: float | None = 0.25
     post_relax_selection: StageSelectionConfig | None = None
     work_dir: Path | None = None
 

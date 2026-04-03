@@ -8,6 +8,7 @@ from ase import Atoms
 
 from adsorption_ensemble.basin.anomaly import classify_anomaly
 from adsorption_ensemble.basin.dedup import (
+    cluster_by_binding_pattern_and_surface_distance,
     cluster_by_signature_and_mace_node_l2,
     cluster_by_signature_and_rmsd,
     cluster_by_signature_only,
@@ -124,6 +125,7 @@ class BasinBuilder:
                 except Exception:
                     pass
         dedup_metric = str(cfg.dedup_metric).strip().lower()
+        dedup_meta: dict = {}
         if dedup_metric in {"signature", "signature_only"}:
             basins_raw = cluster_by_signature_only(
                 frames=window_keep,
@@ -131,6 +133,21 @@ class BasinBuilder:
                 slab_n=int(slab_n),
                 binding_tau=float(cfg.binding_tau),
                 signature_mode=str(cfg.signature_mode),
+            )
+        elif dedup_metric in {"binding_surface", "binding_surface_distance", "surface_binding_distance", "binding_surface_descriptor"}:
+            basins_raw, dedup_meta = cluster_by_binding_pattern_and_surface_distance(
+                frames=window_keep,
+                energies=np.asarray(window_energies, dtype=float),
+                slab_n=int(slab_n),
+                binding_tau=float(cfg.binding_tau),
+                surface_distance_threshold=float(cfg.surface_descriptor_threshold),
+                surface_nearest_k=int(cfg.surface_descriptor_nearest_k),
+                surface_atom_mode=str(cfg.surface_descriptor_atom_mode),
+                surface_relative=bool(cfg.surface_descriptor_relative),
+                surface_rmsd_gate=cfg.surface_descriptor_rmsd_gate,
+                cluster_method=str(cfg.dedup_cluster_method),
+                fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
             )
         elif dedup_metric in {"rmsd"}:
             basins_raw = cluster_by_signature_and_rmsd(
@@ -171,7 +188,6 @@ class BasinBuilder:
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=True,
             )
-        dedup_meta: dict = {}
         if dedup_metric in {"mace", "mace_node_l2", "mace_l2"}:
             basins_raw, dedup_meta = cluster_by_signature_and_mace_node_l2(
                 frames=window_keep,
