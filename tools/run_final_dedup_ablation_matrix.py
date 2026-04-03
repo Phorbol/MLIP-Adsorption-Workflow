@@ -37,19 +37,37 @@ def _miller_case_registry() -> dict[str, dict[str, Any]]:
 
 def _default_configs(mace_model_path: str, mace_device: str, mace_dtype: str) -> dict[str, BasinConfig]:
     common = {
-        "dedup_cluster_method": "hierarchical",
         "energy_window_ev": 2.5,
         "desorption_min_bonds": 1,
         "binding_tau": 1.15,
         "work_dir": None,
     }
     return {
-        "prov_rmsd": BasinConfig(dedup_metric="rmsd", signature_mode="provenance", rmsd_threshold=0.10, **common),
-        "abs_rmsd": BasinConfig(dedup_metric="rmsd", signature_mode="absolute", rmsd_threshold=0.10, **common),
-        "canon_rmsd": BasinConfig(dedup_metric="rmsd", signature_mode="canonical", rmsd_threshold=0.10, **common),
+        "prov_rmsd": BasinConfig(
+            dedup_metric="rmsd",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            rmsd_threshold=0.10,
+            **common,
+        ),
+        "abs_rmsd": BasinConfig(
+            dedup_metric="rmsd",
+            signature_mode="absolute",
+            dedup_cluster_method="hierarchical",
+            rmsd_threshold=0.10,
+            **common,
+        ),
+        "canon_rmsd": BasinConfig(
+            dedup_metric="rmsd",
+            signature_mode="canonical",
+            dedup_cluster_method="hierarchical",
+            rmsd_threshold=0.10,
+            **common,
+        ),
         "binding_surface": BasinConfig(
             dedup_metric="binding_surface_distance",
             signature_mode="provenance",
+            dedup_cluster_method="greedy",
             surface_descriptor_threshold=0.30,
             surface_descriptor_nearest_k=8,
             surface_descriptor_atom_mode="binding_only",
@@ -57,10 +75,28 @@ def _default_configs(mace_model_path: str, mace_device: str, mace_dtype: str) ->
             surface_descriptor_rmsd_gate=0.25,
             **common,
         ),
-        "pure_rmsd": BasinConfig(dedup_metric="pure_rmsd", signature_mode="provenance", rmsd_threshold=0.10, **common),
+        "binding_surface_hierarchical": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            **common,
+        ),
+        "pure_rmsd": BasinConfig(
+            dedup_metric="pure_rmsd",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            rmsd_threshold=0.10,
+            **common,
+        ),
         "pure_mace_0p05": BasinConfig(
             dedup_metric="pure_mace",
             signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
             mace_node_l2_threshold=0.05,
             mace_model_path=str(mace_model_path),
             mace_device=str(mace_device),
@@ -70,6 +106,7 @@ def _default_configs(mace_model_path: str, mace_device: str, mace_dtype: str) ->
         "pure_mace_0p10": BasinConfig(
             dedup_metric="pure_mace",
             signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
             mace_node_l2_threshold=0.10,
             mace_model_path=str(mace_model_path),
             mace_device=str(mace_device),
