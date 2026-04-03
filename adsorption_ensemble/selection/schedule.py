@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 from ase import Atoms
 
-from adsorption_ensemble.selection.strategies import DualThresholdSelector, EnergyWindowFilter, FarthestPointSamplingSelector, RMSDSelector
+from adsorption_ensemble.selection.strategies import (
+    DualThresholdSelector,
+    EnergyWindowFilter,
+    FarthestPointSamplingSelector,
+    PCAGridOccupancyConvergenceCriterion,
+    RMSDSelector,
+    SiteOccupancyConvergenceCriterion,
+)
 
 
 @dataclass
@@ -20,6 +28,21 @@ class StageSelectionConfig:
     cluster_method: str = "hierarchical"
     descriptor: str = "adsorbate_surface_distance"
     random_seed: int = 0
+    seed_indices: tuple[int, ...] = ()
+    fps_round_size: int | None = None
+    fps_rounds: int | None = None
+    occupancy_convergence: bool = False
+    occupancy_bucket_keys: tuple[str, ...] = ("basis_id", "primitive_index", "conformer_id", "azimuth_index", "height_shift_index")
+    occupancy_min_new_bins: int = 0
+    occupancy_patience: int = 2
+    occupancy_min_rounds: int = 1
+    grid_convergence: bool = False
+    grid_convergence_pca_var: float = 0.95
+    grid_convergence_grid_bins: int = 12
+    grid_convergence_min_rounds: int = 5
+    grid_convergence_patience: int = 3
+    grid_convergence_min_coverage_gain: float = 1e-3
+    grid_convergence_min_novelty: float = 5e-2
 
 
 def apply_stage_selection(
@@ -28,6 +51,7 @@ def apply_stage_selection(
     config: StageSelectionConfig | None,
     slab_n: int = 0,
     energies: np.ndarray | None = None,
+    artifacts_dir: str | Path | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     n = int(len(frames))
     if n == 0:
@@ -50,11 +74,56 @@ def apply_stage_selection(
     if strategy in {"fps", "iterative_fps"}:
         cand = _apply_energy_window(ids=ids, energies=e, delta_e=cfg.energy_window_ev)
         k = int(cfg.max_candidates) if int(cfg.max_candidates) > 0 else len(cand)
-        selected = FarthestPointSamplingSelector(random_seed=int(cfg.random_seed)).select(
-            features=feat,
-            k=min(k, len(cand)),
-            candidate_ids=cand,
+        iterative_enabled = bool(
+            strategy == "iterative_fps"
+            or cfg.seed_indices
+            or cfg.fps_round_size is not None
+            or cfg.fps_rounds is not None
+            or bool(cfg.occupancy_convergence)
+            or bool(cfg.grid_convergence)
         )
+        selector = FarthestPointSamplingSelector(random_seed=int(cfg.random_seed))
+        convergence = None
+        if bool(cfg.grid_convergence):
+            convergence = PCAGridOccupancyConvergenceCriterion(
+                features=np.asarray(feat, dtype=float),
+                candidate_ids=list(cand),
+                pca_variance_threshold=float(cfg.grid_convergence_pca_var),
+                grid_bins=int(cfg.grid_convergence_grid_bins),
+                min_rounds=int(cfg.grid_convergence_min_rounds),
+                patience=int(cfg.grid_convergence_patience),
+                min_coverage_gain=float(cfg.grid_convergence_min_coverage_gain),
+                min_novelty=float(cfg.grid_convergence_min_novelty),
+            )
+        elif bool(cfg.occupancy_convergence):
+            convergence = SiteOccupancyConvergenceCriterion(
+                bucket_keys=tuple(str(x) for x in cfg.occupancy_bucket_keys),
+                min_new_bins=int(cfg.occupancy_min_new_bins),
+                patience=int(cfg.occupancy_patience),
+                min_rounds=int(cfg.occupancy_min_rounds),
+            )
+        if iterative_enabled:
+            metadata_items = [dict(getattr(a, "info", {}) or {}) for a in frames]
+            result = selector.select_iterative(
+                features=np.asarray(feat, dtype=float),
+                k=min(k, len(cand)),
+                candidate_ids=cand,
+                seed_ids=[int(i) for i in cfg.seed_indices],
+                round_size=(None if cfg.fps_round_size is None else int(cfg.fps_round_size)),
+                rounds=(None if cfg.fps_rounds is None else int(cfg.fps_rounds)),
+                metadata_items=metadata_items,
+                convergence=convergence,
+            )
+            selected = list(result.selected_ids)
+            round_dir = _write_iterative_round_artifacts(artifacts_dir=artifacts_dir, round_selected_ids=result.round_selected_ids)
+        else:
+            selected = selector.select(
+                features=feat,
+                k=min(k, len(cand)),
+                candidate_ids=cand,
+            )
+            result = None
+            round_dir = None
         diagnostics = {
             "enabled": True,
             "strategy": strategy,
@@ -64,6 +133,15 @@ def apply_stage_selection(
             "n_selected": int(len(selected)),
             "selected_ids": [int(i) for i in selected],
         }
+        if result is not None:
+            diagnostics["seed_indices"] = [int(i) for i in cfg.seed_indices]
+            diagnostics["fps_round_size"] = (None if cfg.fps_round_size is None else int(cfg.fps_round_size))
+            diagnostics["fps_rounds"] = (None if cfg.fps_rounds is None else int(cfg.fps_rounds))
+            diagnostics["round_selected_ids"] = [[int(i) for i in row] for row in result.round_selected_ids]
+            diagnostics["stopped_by_convergence"] = bool(result.stopped_by_convergence)
+            diagnostics["metrics"] = dict(result.metrics)
+            if round_dir is not None:
+                diagnostics["round_dir"] = round_dir.as_posix()
         return selected, diagnostics
     if strategy in {"energy_rmsd_window", "molclus", "molclus_like"}:
         if e is None:
@@ -158,13 +236,44 @@ def _adsorbate_surface_distance_features(*, frames: list[Atoms], slab_n: int) ->
         positions = np.asarray(atoms.get_positions(), dtype=float)
         slab_pos = positions[: int(slab_n)]
         ads_pos = positions[int(slab_n) :]
+        cell = np.asarray(atoms.cell.array, dtype=float)
+        pbc = np.asarray(atoms.get_pbc(), dtype=bool)
+        try:
+            inv_cell = np.asarray(np.linalg.inv(cell), dtype=float)
+        except np.linalg.LinAlgError:
+            inv_cell = None
         k = 0
         for apos in ads_pos:
-            dists = np.linalg.norm(slab_pos - apos[None, :], axis=1)
+            vec = slab_pos - apos[None, :]
+            if inv_cell is not None:
+                frac = np.asarray(vec @ inv_cell, dtype=float)
+                for ax in range(3):
+                    if bool(pbc[ax]):
+                        frac[:, ax] -= np.round(frac[:, ax])
+                vec = frac @ cell
+            dists = np.linalg.norm(vec, axis=1)
             sorted_dists = np.sort(np.asarray(dists, dtype=float))
             out[i, k : k + int(slab_n)] = sorted_dists
             k += int(slab_n)
     return out
+
+
+def _write_iterative_round_artifacts(
+    *,
+    artifacts_dir: str | Path | None,
+    round_selected_ids: list[list[int]],
+) -> Path | None:
+    if artifacts_dir is None or not round_selected_ids:
+        return None
+    out_dir = Path(artifacts_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cumulative: list[int] = []
+    for idx, row in enumerate(round_selected_ids, start=1):
+        arr = np.asarray([int(i) for i in row], dtype=int)
+        np.save(out_dir / f"round_{idx:03d}_indices.npy", arr)
+        cumulative.extend(int(i) for i in row)
+        np.save(out_dir / f"round_{idx:03d}_cumulative_indices.npy", np.asarray(cumulative, dtype=int))
+    return out_dir
 
 
 def _apply_energy_window(ids: list[int], energies: np.ndarray | None, delta_e: float | None) -> list[int]:

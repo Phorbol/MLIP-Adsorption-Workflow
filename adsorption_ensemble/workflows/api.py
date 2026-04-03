@@ -30,6 +30,8 @@ class SamplingSchedule:
 def list_sampling_schedule_presets() -> list[str]:
     return [
         "multistage_default",
+        "multistage_iterative_fps_grid",
+        "multistage_iterative_fps_site",
         "no_selection",
         "fps_then_molclus",
         "fps_then_hierarchical",
@@ -51,6 +53,10 @@ def make_sampling_schedule(
         "default": "multistage_default",
         "multistage": "multistage_default",
         "molclus_like_default": "multistage_default",
+        "adaptive_default": "multistage_iterative_fps_grid",
+        "iterative_fps_default": "multistage_iterative_fps_grid",
+        "iterative_grid": "multistage_iterative_fps_grid",
+        "iterative_site": "multistage_iterative_fps_site",
         "none": "no_selection",
         "off": "no_selection",
         "disabled": "no_selection",
@@ -83,6 +89,69 @@ def make_sampling_schedule(
                 "Conservative multistage default: FPS trims the raw pose pool before relax; "
                 "post-relax Molclus-like energy-window plus geometry diversity keeps low-energy "
                 "coverage without assuming a fixed cluster count."
+            ),
+        )
+    elif canonical == "multistage_iterative_fps_grid":
+        schedule = SamplingSchedule(
+            name="multistage_iterative_fps_grid",
+            exhaustive_pose_sampling=False,
+            run_conformer_search=False,
+            pre_relax_selection=StageSelectionConfig(
+                enabled=True,
+                strategy="iterative_fps",
+                max_candidates=24,
+                descriptor="adsorbate_surface_distance",
+                random_seed=0,
+                fps_round_size=4,
+                fps_rounds=12,
+                grid_convergence=True,
+                grid_convergence_pca_var=0.95,
+                grid_convergence_grid_bins=12,
+                grid_convergence_min_rounds=3,
+                grid_convergence_patience=2,
+                grid_convergence_min_coverage_gain=1e-3,
+                grid_convergence_min_novelty=5e-2,
+            ),
+            post_relax_selection=StageSelectionConfig(
+                enabled=True,
+                strategy="energy_rmsd_window",
+                energy_window_ev=3.0,
+                rmsd_threshold=0.05,
+                descriptor="adsorbate_surface_distance",
+            ),
+            notes=(
+                "Adaptive multistage preset: iterative FPS stops early when PCA-grid occupancy saturates; "
+                "post-relax Molclus-like energy-window plus geometry diversity keeps low-energy coverage."
+            ),
+        )
+    elif canonical == "multistage_iterative_fps_site":
+        schedule = SamplingSchedule(
+            name="multistage_iterative_fps_site",
+            exhaustive_pose_sampling=False,
+            run_conformer_search=False,
+            pre_relax_selection=StageSelectionConfig(
+                enabled=True,
+                strategy="iterative_fps",
+                max_candidates=24,
+                descriptor="adsorbate_surface_distance",
+                random_seed=0,
+                fps_round_size=4,
+                fps_rounds=12,
+                occupancy_convergence=True,
+                occupancy_min_new_bins=0,
+                occupancy_patience=2,
+                occupancy_min_rounds=2,
+            ),
+            post_relax_selection=StageSelectionConfig(
+                enabled=True,
+                strategy="energy_rmsd_window",
+                energy_window_ev=3.0,
+                rmsd_threshold=0.05,
+                descriptor="adsorbate_surface_distance",
+            ),
+            notes=(
+                "Adaptive multistage preset: iterative FPS stops when new site/provenance bins plateau; "
+                "post-relax Molclus-like filtering remains unchanged."
             ),
         )
     elif canonical == "no_selection":

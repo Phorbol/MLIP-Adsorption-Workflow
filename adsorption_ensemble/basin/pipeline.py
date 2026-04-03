@@ -104,6 +104,7 @@ class BasinBuilder:
                 config=cfg.post_relax_selection,
                 slab_n=int(slab_n),
                 energies=np.asarray(window_energies, dtype=float),
+                artifacts_dir=((work_dir / "post_relax_selection_rounds") if work_dir is not None else None),
             )
             window_keep = [window_keep[i] for i in post_relax_selected_ids]
             window_energies = [window_energies[i] for i in post_relax_selected_ids]

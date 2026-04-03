@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 from ase import Atoms
@@ -105,6 +107,116 @@ class TestStageSelection(unittest.TestCase):
         self.assertEqual(pair_ids, [0])
         self.assertEqual(surface_ids, [0, 1])
         self.assertEqual(diag["n_clusters"], 2)
+
+    def test_iterative_fps_grid_convergence_writes_round_artifacts(self):
+        frames = []
+        for idx in range(12):
+            atoms = Atoms(
+                "PtPtHHO",
+                positions=[
+                    [0, 0, 0],
+                    [2, 0, 0],
+                    [0.0 + 0.02 * (idx % 2), 0.0, 1.5],
+                    [0.95 + 0.02 * (idx % 2), 0.0, 1.5],
+                    [0.3, 0.8 + 0.02 * (idx // 2 % 2), 1.5],
+                ],
+                cell=[4.0, 4.0, 8.0],
+                pbc=[True, True, False],
+            )
+            atoms.info["basis_id"] = idx % 2
+            atoms.info["primitive_index"] = idx
+            frames.append(atoms)
+        with TemporaryDirectory() as td:
+            ids, diag = apply_stage_selection(
+                frames=frames,
+                config=StageSelectionConfig(
+                    enabled=True,
+                    strategy="iterative_fps",
+                    max_candidates=10,
+                    descriptor="adsorbate_surface_distance",
+                    random_seed=0,
+                    fps_round_size=2,
+                    fps_rounds=8,
+                    grid_convergence=True,
+                    grid_convergence_grid_bins=2,
+                    grid_convergence_min_rounds=2,
+                    grid_convergence_patience=1,
+                    grid_convergence_min_coverage_gain=1e-6,
+                    grid_convergence_min_novelty=0.25,
+                ),
+                slab_n=2,
+                artifacts_dir=Path(td) / "rounds",
+            )
+            self.assertGreaterEqual(len(ids), 2)
+            self.assertTrue(diag["stopped_by_convergence"])
+            self.assertTrue((Path(diag["round_dir"]) / "round_001_indices.npy").exists())
+            self.assertIn("convergence", diag["metrics"])
+
+    def test_iterative_fps_site_occupancy_convergence_uses_metadata_bins(self):
+        frames = []
+        for idx in range(12):
+            atoms = Atoms(
+                "PtPtHHO",
+                positions=[
+                    [0, 0, 0],
+                    [2, 0, 0],
+                    [0.0 + 0.02 * (idx % 3), 0.0, 1.5],
+                    [0.95 + 0.02 * (idx % 3), 0.0, 1.5],
+                    [0.3, 0.8, 1.5],
+                ],
+            )
+            atoms.info["basis_id"] = idx % 2
+            atoms.info["primitive_index"] = idx % 2
+            frames.append(atoms)
+        ids, diag = apply_stage_selection(
+            frames=frames,
+            config=StageSelectionConfig(
+                enabled=True,
+                strategy="iterative_fps",
+                max_candidates=10,
+                descriptor="adsorbate_pair_distance",
+                random_seed=0,
+                fps_round_size=2,
+                fps_rounds=8,
+                occupancy_convergence=True,
+                occupancy_bucket_keys=("basis_id",),
+                occupancy_min_new_bins=0,
+                occupancy_min_rounds=2,
+                occupancy_patience=1,
+            ),
+            slab_n=2,
+        )
+        self.assertGreaterEqual(len(ids), 2)
+        self.assertTrue(diag["stopped_by_convergence"])
+        conv = diag["metrics"]["convergence"]
+        self.assertEqual(conv["bucket_keys"], ["basis_id"])
+        self.assertIn("round_metrics", conv)
+
+    def test_surface_distance_descriptor_respects_pbc_equivalence(self):
+        frame_a = Atoms(
+            "PtPtH",
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.5, 0.0, 0.0],
+                [0.1, 0.0, 1.4],
+            ],
+            cell=[2.0, 2.0, 8.0],
+            pbc=[True, True, False],
+        )
+        frame_b = frame_a.copy()
+        frame_b.positions[-1, 0] += 2.0
+        ids, diag = apply_stage_selection(
+            frames=[frame_a, frame_b],
+            config=StageSelectionConfig(
+                enabled=True,
+                strategy="hierarchical",
+                cluster_threshold=1e-6,
+                descriptor="adsorbate_surface_distance",
+            ),
+            slab_n=2,
+        )
+        self.assertEqual(ids, [0])
+        self.assertEqual(diag["n_clusters"], 1)
 
 
 if __name__ == "__main__":

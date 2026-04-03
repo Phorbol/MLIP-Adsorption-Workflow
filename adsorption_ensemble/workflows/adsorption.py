@@ -177,6 +177,7 @@ def run_adsorption_workflow(
         config=cfg.pre_relax_selection,
         slab_n=len(slab),
         energies=None,
+        artifacts_dir=(work_dir / "pre_relax_selection_rounds"),
     )
     basin_input_frames = [pose_frames[i] for i in pre_relax_selected_ids]
     if basin_input_frames and bool(cfg.pre_relax_selection.enabled):
