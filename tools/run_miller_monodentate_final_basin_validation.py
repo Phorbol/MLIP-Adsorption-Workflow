@@ -12,6 +12,7 @@ from ase.build import add_adsorbate
 from ase.io import read, write
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
+from adsorption_ensemble.benchmark import audit_cu111_co_case
 from adsorption_ensemble.basin.dedup import symmetry_aware_kabsch_rmsd
 from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
@@ -31,6 +32,7 @@ def _make_relax_backend() -> MACEBatchRelaxBackend:
             dtype="float32",
             max_edges_per_batch=20000,
             head_name="omat_pbe",
+            enable_cueq=True,
             strict=True,
         )
     )
@@ -45,6 +47,13 @@ def _manual_basin_config(work_dir: Path, *, dedup_metric: str, signature_mode: s
         signature_mode=str(signature_mode),
         dedup_cluster_method="hierarchical",
         rmsd_threshold=0.10,
+        mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
+        mace_device="cuda",
+        mace_dtype="float32",
+        mace_head_name="omat_pbe",
+        final_basin_merge_metric="mace_node_l2",
+        final_basin_merge_node_l2_threshold=0.20,
+        final_basin_merge_cluster_method="hierarchical",
         desorption_min_bonds=1,
         post_relax_selection=post_relax_selection,
         work_dir=work_dir,
@@ -113,20 +122,27 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
     for j, b in enumerate(manual_basins):
         b_pos = np.asarray(b.get_positions(), dtype=float)[slab_n:]
         b_ads = b[slab_n:]
-        found = None
+        best = None
         for i, a in enumerate(ours_basins):
             sig_a = str(a.info.get("signature", ""))
             sig_b = str(b.info.get("signature", ""))
-            if sig_a != sig_b:
-                continue
             a_pos = np.asarray(a.get_positions(), dtype=float)[slab_n:]
             d = float(symmetry_aware_kabsch_rmsd(a_pos, b_pos, b_ads))
-            if np.isfinite(d) and d <= float(rmsd_threshold):
-                found = {"manual_index": int(j), "ours_index": int(i), "signature": sig_a, "rmsd": float(d)}
-                break
-        if found is not None:
+            if not np.isfinite(d):
+                continue
+            candidate = {
+                "manual_index": int(j),
+                "ours_index": int(i),
+                "signature": sig_a,
+                "signature_match": bool(sig_a == sig_b and sig_a.strip()),
+                "rmsd": float(d),
+            }
+            rank = (0 if candidate["signature_match"] else 1, float(d), int(i))
+            if best is None or rank < best[0]:
+                best = (rank, candidate)
+        if best is not None and float(best[1]["rmsd"]) <= float(rmsd_threshold):
             matched += 1
-            matches.append(found)
+            matches.append(best[1])
     return {
         "matched_manual_basins": int(matched),
         "n_manual_basins": int(len(manual_basins)),
@@ -177,6 +193,15 @@ def run(args: argparse.Namespace) -> Path:
                 schedule=schedule,
                 dedup_metric=str(args.dedup_metric),
                 signature_mode=str(args.signature_mode),
+                basin_overrides={
+                    "mace_model_path": "/root/.cache/mace/mace-omat-0-small.model",
+                    "mace_device": "cuda",
+                    "mace_dtype": "float32",
+                    "mace_head_name": "omat_pbe",
+                    "final_basin_merge_metric": "mace_node_l2",
+                    "final_basin_merge_node_l2_threshold": 0.20,
+                    "final_basin_merge_cluster_method": "hierarchical",
+                },
                 basin_relax_backend=relax_backend,
             )
             ours_basins = _load_basins(ours_result.files.get("basins_extxyz"))
@@ -237,6 +262,10 @@ def run(args: argparse.Namespace) -> Path:
                     "overlap": overlap,
                 }
             )
+            if str(slab_name) == "Cu_fcc111" and str(mol_name) == "CO":
+                sentinel = audit_cu111_co_case(case_dir)
+                _write_json(case_dir / "cu111_co_sentinel_audit.json", sentinel)
+                rows[-1]["sentinel_audit"] = sentinel
             _write_json(case_dir / "case_summary.json", rows[-1])
 
     recalls = [float(r["overlap"]["manual_recall_by_ours"]) for r in rows]
@@ -244,6 +273,12 @@ def run(args: argparse.Namespace) -> Path:
     total_pose_frames_selected_for_basin = int(sum(int(r["ours"]["n_pose_frames_selected_for_basin"]) for r in rows))
     total_ours_basins = int(sum(int(r["ours"]["n_basins"]) for r in rows))
     total_manual_basins = int(sum(int(r["ase_manual"]["n_basins"]) for r in rows))
+    sentinel_rows = [dict(r) for r in rows if isinstance(r.get("sentinel_audit"), dict)]
+    suspicious_rows = [
+        dict(r)
+        for r in sentinel_rows
+        if str(r["sentinel_audit"].get("interpretation", "")) == "suspicious_hollow_collapse"
+    ]
     payload = {
         "out_root": out_root.as_posix(),
         "mace_model_path": "/root/.cache/mace/mace-omat-0-small.model",
@@ -260,6 +295,19 @@ def run(args: argparse.Namespace) -> Path:
         "mean_manual_recall_by_ours": (None if not recalls else float(np.mean(recalls))),
         "min_manual_recall_by_ours": (None if not recalls else float(np.min(recalls))),
         "n_full_recall": int(sum(1 for v in recalls if abs(v - 1.0) <= 1e-12)),
+        "n_sentinel_cases": int(len(sentinel_rows)),
+        "n_suspicious_hollow_collapse_cases": int(len(suspicious_rows)),
+        "suspicious_hollow_collapse_cases": [
+            {
+                "case": str(row["case"]),
+                "work_dir": str(row["ours"]["work_dir"]),
+                "interpretation": str(row["sentinel_audit"].get("interpretation", "")),
+                "coordination": int(row["sentinel_audit"]["final_binding_environment"].get("coordination", -1)),
+                "n_basis_sites": int(row["sentinel_audit"].get("n_basis_sites", 0)),
+                "workflow_n_basins": int(row["sentinel_audit"].get("workflow_n_basins", 0)),
+            }
+            for row in suspicious_rows
+        ],
         "rows": rows,
     }
     out_path = out_root / "miller_monodentate_final_basin_validation.json"
@@ -275,7 +323,7 @@ def main() -> int:
     parser.add_argument("--max-slabs", type=int, default=0)
     parser.add_argument("--max-molecules", type=int, default=0)
     parser.add_argument("--rmsd-threshold", type=float, default=0.20)
-    parser.add_argument("--dedup-metric", type=str, default="rmsd")
+    parser.add_argument("--dedup-metric", type=str, default="binding_surface_distance")
     parser.add_argument("--signature-mode", type=str, default="provenance", choices=["absolute", "canonical", "provenance", "none"])
     parser.add_argument("--placement-mode", type=str, default="anchor_free", choices=["anchor_free", "anchor_aware"])
     parser.add_argument("--schedule-preset", type=str, default="multistage_default", choices=list_sampling_schedule_presets())

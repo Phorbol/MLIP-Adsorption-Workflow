@@ -32,6 +32,17 @@ class TestWorkflowPresets(unittest.TestCase):
         self.assertEqual(cfg.basin_config.dedup_metric, "rmsd")
         self.assertEqual(cfg.basin_config.desorption_min_bonds, 1)
 
+    def test_workflow_preset_defaults_to_surface_then_auto_mace_merge(self):
+        cfg = make_adsorption_workflow_config(Path("artifacts") / "preset_default")
+        self.assertEqual(cfg.basin_config.dedup_metric, "binding_surface_distance")
+        self.assertEqual(cfg.basin_config.dedup_cluster_method, "greedy")
+        self.assertEqual(cfg.basin_config.mace_device, "cuda")
+        self.assertEqual(cfg.basin_config.mace_dtype, "float32")
+        self.assertEqual(cfg.basin_config.final_basin_merge_metric, "auto_mace")
+        self.assertEqual(cfg.basin_config.final_basin_merge_cluster_method, "hierarchical")
+        self.assertAlmostEqual(float(cfg.basin_config.mace_node_l2_threshold), 0.20)
+        self.assertAlmostEqual(float(cfg.basin_config.final_basin_merge_node_l2_threshold), 0.20)
+
     def test_sampling_schedule_default_is_conservative_multistage(self):
         sched = make_sampling_schedule()
         self.assertEqual(sched.name, "multistage_default")

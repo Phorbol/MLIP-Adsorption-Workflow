@@ -492,6 +492,15 @@ def _descriptor_signature(pattern_sig: str, surface_desc: np.ndarray | None) -> 
     return hashlib.sha1(f"{pattern_sig}|{rounded}".encode("utf-8")).hexdigest()[:16]
 
 
+def _node_descriptor_signature(node_desc: np.ndarray | None, *, fallback_signature: str = "") -> str:
+    if node_desc is None:
+        payload = str(fallback_signature).encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()[:16]
+    desc = np.asarray(node_desc, dtype=float).reshape(-1)
+    rounded = ",".join(f"{float(v):.4f}" for v in desc.tolist())
+    return hashlib.sha1(rounded.encode("utf-8")).hexdigest()[:16]
+
+
 def cluster_by_binding_pattern_and_surface_distance(
     frames: list[Atoms],
     energies: np.ndarray,
@@ -587,13 +596,20 @@ def cluster_by_signature_and_mace_node_l2(
     use_signature_grouping: bool = True,
 ) -> tuple[list[dict], dict]:
     if node_descriptors is None:
+        from adsorption_ensemble.relax.backends import normalize_mace_descriptor_config
         from adsorption_ensemble.conformer_md.config import MACEInferenceConfig
         from adsorption_ensemble.conformer_md.mace_inference import MACEBatchInferencer
 
-        cfg = MACEInferenceConfig(
-            model_path=str(mace_model_path) if mace_model_path else None,
+        model_path_use, device_use, dtype_use = normalize_mace_descriptor_config(
+            model_path=mace_model_path,
             device=str(mace_device),
             dtype=str(mace_dtype),
+            strict=False,
+        )
+        cfg = MACEInferenceConfig(
+            model_path=str(model_path_use) if model_path_use else None,
+            device=str(device_use),
+            dtype=str(dtype_use),
             max_edges_per_batch=int(mace_max_edges_per_batch),
             num_workers=1,
             layers_to_keep=int(mace_layers_to_keep),
@@ -644,6 +660,12 @@ def cluster_by_signature_and_mace_node_l2(
         )
         for members in clusters:
             rep = sorted(members, key=lambda x: (np.nan_to_num(x["energy"], nan=np.inf), x["candidate_id"]))[0]
+            basin_signature = str(sig)
+            if (not bool(use_signature_grouping)) or str(sig) == "all":
+                basin_signature = _node_descriptor_signature(
+                    rep.get("node_desc"),
+                    fallback_signature="|".join(sorted(set(str(x.get("signature", "")) for x in members))),
+                )
             basins.append(
                 {
                     "basin_id": int(basin_id),
@@ -651,7 +673,7 @@ def cluster_by_signature_and_mace_node_l2(
                     "energy": float(rep["energy"]),
                     "member_candidate_ids": [int(x["candidate_id"]) for x in members],
                     "binding_pairs": rep["binding_pairs"],
-                    "signature": sig,
+                    "signature": basin_signature,
                     "node_desc": rep.get("node_desc"),
                 }
             )
@@ -664,6 +686,94 @@ def cluster_by_signature_and_mace_node_l2(
     meta["signature_mode"] = str(signature_mode)
     meta["use_signature_grouping"] = bool(use_signature_grouping)
     return basins, meta
+
+
+def merge_basin_representatives_by_mace_node_l2(
+    basins: list[dict],
+    *,
+    slab_n: int,
+    binding_tau: float,
+    node_l2_threshold: float,
+    mace_model_path: str | None,
+    mace_device: str,
+    mace_dtype: str,
+    mace_max_edges_per_batch: int,
+    mace_layers_to_keep: int,
+    mace_head_name: str | None,
+    mace_mlp_energy_key: str | None,
+    cluster_method: str = "hierarchical",
+    l2_mode: str = "mean_atom",
+    fuzzy_sigma_scale: float = 1.5,
+    fuzzy_membership_cutoff: float = 0.5,
+    node_descriptors: list[np.ndarray | None] | None = None,
+) -> tuple[list[dict], dict]:
+    if not basins:
+        return [], {
+            "metric": "pure_mace",
+            "n_input_basins": 0,
+            "n_output_basins": 0,
+            "node_l2_threshold": float(node_l2_threshold),
+            "cluster_method": str(cluster_method),
+        }
+    rep_frames = [dict(b)["atoms"] for b in basins]
+    rep_energies = np.asarray(
+        [float(dict(b).get("energy", float("nan"))) for b in basins],
+        dtype=float,
+    )
+    merged_reps, meta = cluster_by_signature_and_mace_node_l2(
+        frames=rep_frames,
+        energies=rep_energies,
+        slab_n=int(slab_n),
+        binding_tau=float(binding_tau),
+        node_l2_threshold=float(node_l2_threshold),
+        mace_model_path=mace_model_path,
+        mace_device=str(mace_device),
+        mace_dtype=str(mace_dtype),
+        mace_max_edges_per_batch=int(mace_max_edges_per_batch),
+        mace_layers_to_keep=int(mace_layers_to_keep),
+        mace_head_name=mace_head_name,
+        mace_mlp_energy_key=mace_mlp_energy_key,
+        cluster_method=str(cluster_method),
+        l2_mode=str(l2_mode),
+        fuzzy_sigma_scale=float(fuzzy_sigma_scale),
+        fuzzy_membership_cutoff=float(fuzzy_membership_cutoff),
+        node_descriptors=node_descriptors,
+        signature_mode="none",
+        use_signature_grouping=False,
+    )
+    merged_basins: list[dict] = []
+    for merged in merged_reps:
+        source_local_ids = sorted(set(int(x) for x in merged.get("member_candidate_ids", [])))
+        source_basins = [dict(basins[i]) for i in source_local_ids if 0 <= int(i) < len(basins)]
+        merged_candidate_ids = sorted(
+            {
+                int(cid)
+                for basin in source_basins
+                for cid in list(dict(basin).get("member_candidate_ids", []))
+            }
+        )
+        source_signatures = sorted({str(dict(basin).get("signature", "")) for basin in source_basins})
+        source_basin_ids = [
+            int(dict(basin).get("basin_id", idx))
+            for idx, basin in zip(source_local_ids, source_basins, strict=False)
+        ]
+        merged_basins.append(
+            {
+                "basin_id": int(merged["basin_id"]),
+                "atoms": merged["atoms"],
+                "energy": float(merged["energy"]),
+                "member_candidate_ids": merged_candidate_ids,
+                "binding_pairs": list(merged["binding_pairs"]),
+                "signature": str(merged["signature"]),
+                "source_basin_ids": source_basin_ids,
+                "source_signatures": source_signatures,
+            }
+        )
+    meta = dict(meta)
+    meta["metric"] = "pure_mace"
+    meta["n_input_basins"] = int(len(basins))
+    meta["n_output_basins"] = int(len(merged_basins))
+    return merged_basins, meta
 
 
 def cluster_by_signature_only(

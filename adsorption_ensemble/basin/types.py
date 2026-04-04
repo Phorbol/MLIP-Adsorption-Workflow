@@ -20,6 +20,9 @@ class BasinConfig:
     rmsd_threshold: float = 0.10
     mace_node_l2_threshold: float = 0.20
     mace_node_l2_mode: str = "mean_atom"
+    final_basin_merge_metric: str = "off"
+    final_basin_merge_node_l2_threshold: float | None = None
+    final_basin_merge_cluster_method: str | None = None
     fuzzy_membership_cutoff: float = 0.50
     fuzzy_sigma_scale: float = 1.50
     mace_model_path: str | None = None

@@ -30,6 +30,7 @@ def _make_relax_backend(kind: str) -> object:
             dtype="float32",
             max_edges_per_batch=20000,
             head_name="omat_pbe",
+            enable_cueq=True,
             strict=True,
         )
     )
@@ -66,8 +67,8 @@ def _workflow_config(work_dir: Path, ads_name: str, *, placement_mode: str = "an
         work_dir=work_dir,
         surface_preprocessor=SurfacePreprocessor(
             min_surface_atoms=6,
-            primary_detector=ProbeScanDetector(grid_step=0.55),
-            fallback_detector=VoxelFloodDetector(spacing=0.75),
+            primary_detector=ProbeScanDetector(grid_step=0.6),
+            fallback_detector=VoxelFloodDetector(spacing=0.8),
             target_surface_fraction=None,
             target_count_mode="off",
         ),
@@ -76,9 +77,22 @@ def _workflow_config(work_dir: Path, ads_name: str, *, placement_mode: str = "an
             relax_maxf=0.1,
             relax_steps=80,
             energy_window_ev=2.5,
-            dedup_metric="rmsd",
-            dedup_cluster_method="hierarchical",
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="greedy",
             rmsd_threshold=0.10,
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
+            mace_device="cuda",
+            mace_dtype="float32",
+            mace_head_name="omat_pbe",
+            final_basin_merge_metric="mace_node_l2",
+            final_basin_merge_node_l2_threshold=0.20,
+            final_basin_merge_cluster_method="hierarchical",
             desorption_min_bonds=1,
             work_dir=None,
         ),
@@ -96,9 +110,22 @@ def _manual_basin_config(work_dir: Path) -> BasinConfig:
         relax_maxf=0.1,
         relax_steps=80,
         energy_window_ev=2.5,
-        dedup_metric="rmsd",
-        dedup_cluster_method="hierarchical",
+        dedup_metric="binding_surface_distance",
+        signature_mode="provenance",
+        dedup_cluster_method="greedy",
         rmsd_threshold=0.10,
+        surface_descriptor_threshold=0.30,
+        surface_descriptor_nearest_k=8,
+        surface_descriptor_atom_mode="binding_only",
+        surface_descriptor_relative=False,
+        surface_descriptor_rmsd_gate=0.25,
+        mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
+        mace_device="cuda",
+        mace_dtype="float32",
+        mace_head_name="omat_pbe",
+        final_basin_merge_metric="mace_node_l2",
+        final_basin_merge_node_l2_threshold=0.20,
+        final_basin_merge_cluster_method="hierarchical",
         desorption_min_bonds=1,
         work_dir=work_dir,
     )
@@ -173,20 +200,27 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
     matches = []
     for j, b in enumerate(manual_basins):
         b_pos = np.asarray(b.get_positions(), dtype=float)[slab_n:]
-        found = None
+        best = None
         for i, a in enumerate(ours_basins):
             sig_a = str(a.info.get("signature", ""))
             sig_b = str(b.info.get("signature", ""))
-            if sig_a != sig_b:
-                continue
             a_pos = np.asarray(a.get_positions(), dtype=float)[slab_n:]
             d = float(kabsch_rmsd(a_pos, b_pos))
-            if np.isfinite(d) and d <= float(rmsd_threshold):
-                found = {"manual_index": int(j), "ours_index": int(i), "signature": sig_a, "rmsd": float(d)}
-                break
-        if found is not None:
+            if not np.isfinite(d):
+                continue
+            candidate = {
+                "manual_index": int(j),
+                "ours_index": int(i),
+                "signature": sig_a,
+                "signature_match": bool(sig_a == sig_b and sig_a.strip()),
+                "rmsd": float(d),
+            }
+            rank = (0 if candidate["signature_match"] else 1, float(d), int(i))
+            if best is None or rank < best[0]:
+                best = (rank, candidate)
+        if best is not None and float(best[1]["rmsd"]) <= float(rmsd_threshold):
             matched += 1
-            matches.append(found)
+            matches.append(best[1])
     return {
         "matched_manual_basins": int(matched),
         "n_manual_basins": int(len(manual_basins)),

@@ -249,7 +249,7 @@ class AdsorptionEnsembleRequest:
     work_dir: str | Path
     placement_mode: str = "anchor_free"
     schedule: SamplingSchedule = field(default_factory=SamplingSchedule)
-    dedup_metric: str = "rmsd"
+    dedup_metric: str = "binding_surface_distance"
     signature_mode: str = "provenance"
     pose_overrides: dict[str, Any] = field(default_factory=dict)
     basin_overrides: dict[str, Any] = field(default_factory=dict)
@@ -271,7 +271,7 @@ def generate_adsorption_ensemble(
     work_dir: str | Path,
     placement_mode: str = "anchor_free",
     schedule: SamplingSchedule | None = None,
-    dedup_metric: str = "rmsd",
+    dedup_metric: str = "binding_surface_distance",
     signature_mode: str = "provenance",
     pose_overrides: dict[str, Any] | None = None,
     basin_overrides: dict[str, Any] | None = None,

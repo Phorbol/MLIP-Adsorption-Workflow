@@ -9,6 +9,7 @@ from ase import Atoms
 from adsorption_ensemble.basin.anomaly import classify_anomaly
 from adsorption_ensemble.basin.dedup import (
     cluster_by_binding_pattern_and_surface_distance,
+    merge_basin_representatives_by_mace_node_l2,
     cluster_by_signature_and_mace_node_l2,
     cluster_by_signature_and_rmsd,
     cluster_by_signature_only,
@@ -231,6 +232,83 @@ class BasinBuilder:
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=False,
             )
+        final_merge_metric = str(cfg.final_basin_merge_metric).strip().lower()
+        final_merge_meta: dict = {
+            "enabled": False,
+            "metric": str(cfg.final_basin_merge_metric),
+            "status": "disabled",
+            "n_input_basins": int(len(basins_raw)),
+            "n_output_basins": int(len(basins_raw)),
+        }
+        if basins_raw and final_merge_metric not in {"", "off", "none", "disabled"}:
+            final_merge_meta["enabled"] = True
+            final_merge_meta["n_input_basins"] = int(len(basins_raw))
+            threshold = cfg.final_basin_merge_node_l2_threshold
+            if threshold is None:
+                threshold = float(cfg.mace_node_l2_threshold)
+            cluster_method = (
+                str(cfg.final_basin_merge_cluster_method)
+                if cfg.final_basin_merge_cluster_method is not None and str(cfg.final_basin_merge_cluster_method).strip()
+                else "hierarchical"
+            )
+            model_path_use = cfg.mace_model_path
+            device_use = str(cfg.mace_device)
+            dtype_use = str(cfg.mace_dtype)
+            if final_merge_metric in {"auto", "auto_mace", "auto_pure_mace"}:
+                from adsorption_ensemble.relax.backends import normalize_mace_descriptor_config
+
+                model_path_use, device_use, dtype_use = normalize_mace_descriptor_config(
+                    model_path=cfg.mace_model_path,
+                    device=str(cfg.mace_device),
+                    dtype=str(cfg.mace_dtype),
+                    strict=False,
+                )
+                if not model_path_use:
+                    final_merge_meta.update(
+                        {
+                            "status": "skipped_no_model",
+                            "n_output_basins": int(len(basins_raw)),
+                            "node_l2_threshold": float(threshold),
+                            "cluster_method": str(cluster_method),
+                        }
+                    )
+            if final_merge_metric in {"mace", "mace_node_l2", "mace_l2", "pure_mace", "auto", "auto_mace", "auto_pure_mace"} and (
+                final_merge_metric not in {"auto", "auto_mace", "auto_pure_mace"} or bool(model_path_use)
+            ):
+                try:
+                    basins_raw, merge_meta = merge_basin_representatives_by_mace_node_l2(
+                        basins=basins_raw,
+                        slab_n=int(slab_n),
+                        binding_tau=float(cfg.binding_tau),
+                        node_l2_threshold=float(threshold),
+                        mace_model_path=model_path_use,
+                        mace_device=str(device_use),
+                        mace_dtype=str(dtype_use),
+                        mace_max_edges_per_batch=int(cfg.mace_max_edges_per_batch),
+                        mace_layers_to_keep=int(cfg.mace_layers_to_keep),
+                        mace_head_name=cfg.mace_head_name,
+                        mace_mlp_energy_key=cfg.mace_mlp_energy_key,
+                        cluster_method=str(cluster_method),
+                        l2_mode=str(cfg.mace_node_l2_mode),
+                        fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
+                        fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                    )
+                    final_merge_meta.update(dict(merge_meta))
+                    final_merge_meta["status"] = "ok"
+                except Exception as exc:
+                    if final_merge_metric in {"auto", "auto_mace", "auto_pure_mace"}:
+                        final_merge_meta.update(
+                            {
+                                "status": "error_fallback",
+                                "error_type": str(type(exc).__name__),
+                                "error_message": str(exc),
+                                "n_output_basins": int(len(basins_raw)),
+                                "node_l2_threshold": float(threshold),
+                                "cluster_method": str(cluster_method),
+                            }
+                        )
+                    else:
+                        raise
         basins: list[Basin] = []
         for b in basins_raw:
             pairs = list(b["binding_pairs"])
@@ -260,5 +338,6 @@ class BasinBuilder:
             "signature_mode": str(cfg.signature_mode),
             "dedup_cluster_method": str(cfg.dedup_cluster_method),
             "dedup_meta": dict(dedup_meta),
+            "final_basin_merge": dict(final_merge_meta),
         }
         return BasinResult(basins=basins, rejected=rejected, relax_backend=str(relax_backend_name), summary=summary)

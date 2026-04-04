@@ -70,6 +70,7 @@ def build_basin_dictionary(
     pose_frames: list[Atoms] | None = None,
     nodes: list[ReactionNode] | None = None,
     slab_n: int | None = None,
+    member_frames_relaxed: bool = False,
 ) -> dict[str, Any]:
     basin_entries = []
     node_by_basin = {int(n.basin_id): n for n in nodes or []}
@@ -93,7 +94,11 @@ def build_basin_dictionary(
             if member_energies:
                 energy_values.extend(member_energies)
                 energy_span = float(np.max(member_energies) - np.min(member_energies))
-        rmsd_stats = _member_rmsd_stats(member_frames=member_frames, slab_n=slab_n)
+        rmsd_stats = (
+            _member_rmsd_stats(member_frames=member_frames, slab_n=slab_n)
+            if bool(member_frames_relaxed)
+            else {"min": None, "max": None, "mean": None}
+        )
         binding_meta = describe_basin_binding(
             basin_atoms=basin.atoms,
             slab_n=(0 if slab_n is None else int(slab_n)),
@@ -116,7 +121,7 @@ def build_basin_dictionary(
                 "member_adsorbate_rmsd_min": rmsd_stats["min"],
                 "member_adsorbate_rmsd_max": rmsd_stats["max"],
                 "member_adsorbate_rmsd_mean": rmsd_stats["mean"],
-                "false_merge_suspect": bool(rmsd_stats["max"] is not None and rmsd_stats["max"] > 0.75),
+                "false_merge_suspect": (None if rmsd_stats["max"] is None else bool(rmsd_stats["max"] > 0.75)),
                 "node_id": (None if node is None else str(node.node_id)),
                 **binding_meta,
                 **provenance_meta,
