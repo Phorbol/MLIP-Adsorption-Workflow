@@ -190,11 +190,118 @@ class TestPoseSampler(unittest.TestCase):
             vectors.append(vec)
         self.assertLess(float(np.dot(vectors[0], vectors[1])), -1.0 + 1e-6)
 
+    def test_linear_adsorbate_site_oriented_quaternions_include_tilted_states_when_budget_allows(self):
+        ads = molecule("CO")
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4))
+        quats = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="diatomic",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        tilts = []
+        for q in quats:
+            rotated = sampler._rotated_adsorbate(ads, q)
+            tilts.append(float(sampler._estimate_tilt_deg(rotated, np.array([0.0, 0.0, 1.0], dtype=float))))
+        self.assertTrue(any(t <= 1e-3 for t in tilts))
+        self.assertTrue(any(t >= 10.0 for t in tilts))
+
+    def test_nonlinear_adsorbate_body_frame_quaternions_are_deterministic_across_rng(self):
+        ads = molecule("H2O")
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4, nonlinear_atom_down_coverage=False))
+        q1 = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        q2 = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(123),
+            n_rot=4,
+        )
+        self.assertEqual(len(q1), len(q2))
+        self.assertTrue(all(float(sampler._quaternion_distance(a, b)) < 1e-8 for a, b in zip(q1, q2, strict=False)))
+
+    def test_nonlinear_adsorbate_body_frame_schedule_is_input_rotation_invariant(self):
+        ads = molecule("H2O")
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        rot = PoseSampler._axis_angle_to_matrix(np.array([0.3, -0.5, 0.8], dtype=float), 0.9)
+        ads_rot = ads.copy()
+        ads_rot.positions = np.asarray(ads.positions, dtype=float) @ rot.T
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4, nonlinear_atom_down_coverage=False))
+        q1 = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        q2 = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads_rot,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        self.assertEqual(len(q1), len(q2))
+        for qa, qb in zip(q1, q2, strict=False):
+            pa = sampler._rotated_adsorbate(ads, qa).positions
+            pb = sampler._rotated_adsorbate(ads_rot, qb).positions
+            self.assertTrue(np.allclose(pa, pb, atol=1e-8))
+
+    def test_nonlinear_quaternion_schedule_includes_hetero_atom_down_for_methanol(self):
+        ads = molecule("CH3OH")
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4))
+        quats = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        lowest_symbols = []
+        for q in quats:
+            rotated = sampler._rotated_adsorbate(ads, q)
+            lowest_idx = int(np.argmin(np.asarray(rotated.positions, dtype=float)[:, 2]))
+            lowest_symbols.append(str(ads[lowest_idx].symbol))
+        self.assertIn("O", lowest_symbols)
+
     def test_select_adsorption_origin_prefers_carbon_end_for_co(self):
         ads = molecule("CO")
         if ads[0].symbol != "C":
             ads = ads[[1, 0]]
         self.assertEqual(PoseSampler._select_adsorption_origin_index(ads), 0)
+
+    def test_select_adsorption_origin_prefers_heavy_donor_for_protic_adsorbates(self):
+        cases = {
+            "H2O": "O",
+            "NH3": "N",
+            "CH3OH": "O",
+        }
+        for name, expected_symbol in cases.items():
+            ads = molecule(name)
+            idx = PoseSampler._select_adsorption_origin_index(ads)
+            self.assertEqual(ads[int(idx)].symbol, expected_symbol)
+
+    def test_orient_adsorbate_for_binding_places_donor_at_origin_and_ligands_upward(self):
+        for name in ("CO", "H2O", "NH3", "CH3OH"):
+            ads = molecule(name)
+            if name == "CO" and ads[0].symbol != "C":
+                ads = ads[[1, 0]]
+            idx = PoseSampler._select_adsorption_origin_index(ads)
+            oriented = PoseSampler.orient_adsorbate_for_binding(ads, binding_atom_index=idx, normal=np.array([0.0, 0.0, 1.0], dtype=float))
+            self.assertTrue(np.allclose(oriented.positions[int(idx)], np.zeros(3), atol=1e-10))
+            other_ids = [i for i in range(len(oriented)) if i != int(idx)]
+            if other_ids:
+                self.assertGreater(float(np.mean(oriented.positions[other_ids, 2])), 0.0)
 
     def test_pose_sampler_anchor_free_places_adsorbate_center_on_site_centerline(self):
         slab = fcc110("Pt", size=(4, 4, 4), vacuum=12.0)
@@ -303,6 +410,25 @@ class TestPoseSampler(unittest.TestCase):
         out = PoseSampler(cfg).sample(slab=slab, adsorbate=ads, primitives=[primitives[3]], surface_atom_ids=ctx.detection.surface_atom_ids)
         self.assertGreater(len(out), 0)
         self.assertGreaterEqual(min(float(p.height) for p in out), 1.45 - 1e-8)
+
+    def test_default_linear_sampling_keeps_tilted_candidates(self):
+        slab, ads, surface_ids, primitives = self._prepare_inputs()
+        cfg = PoseSamplerConfig(
+            n_rotations=4,
+            n_azimuth=8,
+            n_shifts=2,
+            shift_radius=0.15,
+            min_height=1.2,
+            max_height=3.4,
+            height_step=0.1,
+            max_poses_per_site=4,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+        )
+        out = PoseSampler(cfg).sample(slab=slab, adsorbate=ads, primitives=[primitives[0]], surface_atom_ids=surface_ids)
+        self.assertGreater(len(out), 0)
+        self.assertTrue(any(float(p.tilt_deg) >= 10.0 for p in out))
 
     def test_pose_sampler_supports_height_shift_sampling(self):
         slab, ads, surface_ids, primitives = self._prepare_inputs()

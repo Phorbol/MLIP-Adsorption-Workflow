@@ -57,6 +57,8 @@ class PoseSamplerConfig:
     neighborlist_enabled: bool = True
     neighborlist_min_surface_atoms: int = 64
     neighborlist_cutoff_padding: float = 0.30
+    nonlinear_atom_down_coverage: bool = True
+    nonlinear_atom_down_max_vectors: int = 4
 
 
 @dataclass
@@ -868,30 +870,96 @@ class PoseSampler:
         if mol_class == "monatomic":
             return 1, 1, n_shift
         if mol_class in {"diatomic", "linear"}:
-            return max(2, n_rot // 2), max(4, n_az // 2), n_shift
+            # Keep the user-requested angular budget for linear adsorbates.
+            # Reducing it here made default CO/N2 sampling collapse almost entirely
+            # to upright poses, which contradicts the plan's SE(3) sampling intent.
+            return max(2, n_rot), n_az, n_shift
         return n_rot, n_az, n_shift
 
     @staticmethod
     def _select_adsorption_origin_index(adsorbate: Atoms) -> int:
+        return PoseSampler._select_binding_atom_index(adsorbate)
+
+    @staticmethod
+    def _select_binding_atom_index(adsorbate: Atoms) -> int:
         n = int(len(adsorbate))
         if n <= 1:
             return 0
         adj = PoseSampler._build_bond_adjacency(adsorbate)
-        degrees = [len(v) for v in adj]
-        terminal = [i for i, deg in enumerate(degrees) if int(deg) <= 1]
-        candidates = terminal or list(range(n))
         z = np.asarray(adsorbate.get_atomic_numbers(), dtype=int)
+        non_h = [i for i, zi in enumerate(z) if int(zi) != 1]
+        if len(non_h) == 1:
+            return int(non_h[0])
         pos = np.asarray(adsorbate.get_positions(), dtype=float)
         center = np.mean(pos, axis=0)
+        degrees = [len(v) for v in adj]
+        hetero = {7, 8, 15, 16}
 
-        def score(i: int) -> tuple[float, float, float, int]:
+        def has_h_neighbor(i: int) -> bool:
+            return any(int(z[j]) == 1 for j in adj[i])
+
+        def has_c_like_neighbor(i: int) -> bool:
+            return any(int(z[j]) in {6, 14} for j in adj[i])
+
+        def low_en_score(i: int) -> tuple[float, float, float, int]:
             zi = int(z[i])
             en = float(_PAULING_ELECTRONEGATIVITY.get(zi, 10.0))
             radial = float(np.linalg.norm(pos[i] - center))
             return (en, -radial, float(covalent_radii[zi]), int(i))
 
-        best = min(candidates, key=score)
+        def hetero_score(i: int) -> tuple[float, int, float, int]:
+            zi = int(z[i])
+            en = float(_PAULING_ELECTRONEGATIVITY.get(zi, 0.0))
+            radial = float(np.linalg.norm(pos[i] - center))
+            return (en, -int(degrees[i]), radial, -int(i))
+
+        heavy = non_h or list(range(n))
+        protic_hetero = [i for i in heavy if int(z[i]) in hetero and has_h_neighbor(i)]
+        if protic_hetero:
+            return int(max(protic_hetero, key=hetero_score))
+
+        hetero_c_like = [i for i in heavy if int(z[i]) in hetero and has_c_like_neighbor(i) and int(degrees[i]) <= 2]
+        if hetero_c_like and len(heavy) > 2:
+            return int(max(hetero_c_like, key=hetero_score))
+
+        terminal_heavy = [i for i in heavy if int(degrees[i]) <= 1]
+        candidates = terminal_heavy or heavy
+        best = min(candidates, key=low_en_score)
         return int(best)
+
+    @staticmethod
+    def orient_adsorbate_for_binding(
+        adsorbate: Atoms,
+        binding_atom_index: int | None = None,
+        normal: np.ndarray | None = None,
+    ) -> Atoms:
+        idx = PoseSampler._select_binding_atom_index(adsorbate) if binding_atom_index is None else int(binding_atom_index)
+        out = adsorbate.copy()
+        pos = np.asarray(out.get_positions(), dtype=float)
+        if len(pos) == 0:
+            return out
+        anchor = np.asarray(pos[idx], dtype=float)
+        centered = pos - anchor
+        target = np.array([0.0, 0.0, 1.0], dtype=float) if normal is None else np.asarray(normal, dtype=float)
+        target_norm = float(np.linalg.norm(target))
+        if target_norm < 1e-12:
+            target = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            target = target / target_norm
+        other_ids = [i for i in range(len(out)) if int(i) != idx]
+        if other_ids:
+            ref = PoseSampler._best_frame_direction(centered[other_ids])
+            if float(np.linalg.norm(ref)) < 1e-12:
+                axis = PoseSampler._principal_axis(out)
+                ref = np.asarray(axis if axis is not None else target, dtype=float)
+            quat = PoseSampler._quaternion_from_two_vectors(ref, target)
+            if quat is not None:
+                rot = PoseSampler._quaternion_to_matrix(quat)
+                centered = centered @ rot.T
+        out.positions = centered
+        out.info["binding_atom_index"] = int(idx)
+        out.info["binding_atom_symbol"] = str(out[int(idx)].symbol)
+        return out
 
     @staticmethod
     def _build_bond_adjacency(adsorbate: Atoms, bond_tau: float = 1.20) -> list[set[int]]:
@@ -922,12 +990,40 @@ class PoseSampler:
         if mol_class in {"diatomic", "linear"}:
             axis = self._principal_axis(adsorbate_centered)
             if axis is not None:
-                for target in (np.asarray(normal, dtype=float), -np.asarray(normal, dtype=float)):
-                    q = self._quaternion_from_two_vectors(axis, target)
-                    if q is not None:
-                        self._append_unique_quaternion(out, q)
-                        if len(out) >= n_rot:
-                            return out[:n_rot]
+                normal_u = np.asarray(normal, dtype=float)
+                normal_u = normal_u / (np.linalg.norm(normal_u) + 1e-12)
+                tangent = self._reference_tangent(normal_u)
+                for tilt_deg in self._linear_tilt_schedule(n_rot):
+                    theta = np.deg2rad(float(tilt_deg))
+                    target_base = np.cos(theta) * normal_u + np.sin(theta) * tangent
+                    target_base = target_base / (np.linalg.norm(target_base) + 1e-12)
+                    for target in (target_base, -target_base):
+                        q = self._quaternion_from_two_vectors(axis, target)
+                        if q is not None:
+                            self._append_unique_quaternion(out, q)
+                            if len(out) >= n_rot:
+                                return out[:n_rot]
+        elif mol_class == "nonlinear":
+            normal_u = np.asarray(normal, dtype=float)
+            normal_u = normal_u / (np.linalg.norm(normal_u) + 1e-12)
+            if bool(getattr(self.config, "nonlinear_atom_down_coverage", True)):
+                max_vectors = max(1, int(getattr(self.config, "nonlinear_atom_down_max_vectors", 4)))
+                for q_down in self._nonlinear_atom_down_quaternions(
+                    adsorbate_centered,
+                    max_vectors=min(int(n_rot), int(max_vectors)),
+                    normal=normal_u,
+                ):
+                    self._append_unique_quaternion(out, q_down)
+                    if len(out) >= n_rot:
+                        return out[:n_rot]
+            q_align = self._body_frame_alignment_quaternion(adsorbate_centered)
+            for q_body in self._body_frame_euler_schedule(n_rot):
+                q_use = np.asarray(q_body, dtype=float)
+                if q_align is not None:
+                    q_use = self._quaternion_multiply(q_body, q_align)
+                self._append_unique_quaternion(out, q_use)
+                if len(out) >= n_rot:
+                    return out[:n_rot]
         while len(out) < n_rot:
             self._append_unique_quaternion(out, self._sample_uniform_quaternion(rng))
         return out[:n_rot]
@@ -953,21 +1049,180 @@ class PoseSampler:
 
     @staticmethod
     def _principal_axis(adsorbate_centered: Atoms) -> np.ndarray | None:
-        pos = np.asarray(adsorbate_centered.get_positions(), dtype=float)
-        if len(pos) < 2:
+        axes = PoseSampler._principal_axes(adsorbate_centered)
+        if axes is None:
             return None
-        centered = pos - np.mean(pos, axis=0, keepdims=True)
-        cov = centered.T @ centered
-        try:
-            vals, vecs = np.linalg.eigh(cov)
-        except np.linalg.LinAlgError:
-            return None
-        idx = int(np.argmax(vals))
-        axis = np.asarray(vecs[:, idx], dtype=float)
+        axis = np.asarray(axes[:, 0], dtype=float)
         n = np.linalg.norm(axis)
         if n < 1e-12:
             return None
         return axis / n
+
+    @staticmethod
+    def _principal_axes(adsorbate_centered: Atoms) -> np.ndarray | None:
+        pos = np.asarray(adsorbate_centered.get_positions(), dtype=float)
+        if len(pos) < 2:
+            return None
+        masses = np.asarray(adsorbate_centered.get_masses(), dtype=float).reshape(-1)
+        mass_sum = float(np.sum(masses))
+        if mass_sum <= 1e-12:
+            masses = np.ones((len(pos),), dtype=float)
+            mass_sum = float(len(pos))
+        center = np.sum(pos * masses[:, None], axis=0, keepdims=True) / mass_sum
+        centered = pos - center
+        inertia = np.zeros((3, 3), dtype=float)
+        for m, r in zip(masses, centered, strict=False):
+            rr = float(np.dot(r, r))
+            inertia += float(m) * (rr * np.eye(3, dtype=float) - np.outer(r, r))
+        try:
+            vals, vecs = np.linalg.eigh(inertia)
+        except np.linalg.LinAlgError:
+            return None
+        order = np.argsort(np.asarray(vals, dtype=float))
+        axes = np.asarray(vecs[:, order], dtype=float)
+        # Canonicalize the sign of each axis to keep quaternion sampling reproducible.
+        for k in range(axes.shape[1]):
+            axis = axes[:, k]
+            projections = centered @ axis
+            idx = int(np.argmax(np.abs(projections)))
+            if idx < len(projections) and float(projections[idx]) < 0.0:
+                axes[:, k] = -axis
+        if float(np.linalg.det(axes)) < 0.0:
+            axes[:, -1] = -axes[:, -1]
+        return axes
+
+    @staticmethod
+    def _body_frame_alignment_quaternion(adsorbate_centered: Atoms) -> np.ndarray | None:
+        axes = PoseSampler._principal_axes(adsorbate_centered)
+        if axes is None:
+            return None
+        rot = np.asarray(axes.T, dtype=float)
+        return PoseSampler._quaternion_from_matrix(rot)
+
+    @staticmethod
+    def _nonlinear_atom_down_quaternions(
+        adsorbate_centered: Atoms,
+        *,
+        max_vectors: int,
+        normal: np.ndarray,
+    ) -> list[np.ndarray]:
+        pos = np.asarray(adsorbate_centered.get_positions(), dtype=float)
+        if len(pos) <= 1 or max_vectors <= 0:
+            return []
+        z = np.asarray(adsorbate_centered.get_atomic_numbers(), dtype=int)
+        candidate_ids = [
+            int(i)
+            for i, zi in enumerate(z)
+            if int(zi) != 1 and float(np.linalg.norm(pos[i])) > 1e-8
+        ]
+        if not candidate_ids:
+            candidate_ids = [int(i) for i in range(len(pos)) if float(np.linalg.norm(pos[i])) > 1e-8]
+        scored = []
+        for idx in candidate_ids:
+            zi = int(z[idx])
+            en = float(_PAULING_ELECTRONEGATIVITY.get(zi, 0.0))
+            radial = float(np.linalg.norm(pos[idx]))
+            is_hetero = int(zi in {7, 8, 9, 15, 16, 17, 35, 53})
+            scored.append((int(-is_hetero), -en, -radial, int(idx)))
+        scored.sort()
+        out: list[np.ndarray] = []
+        for _, _, _, idx in scored:
+            other_ids = [int(i) for i in range(len(pos)) if int(i) != int(idx)]
+            if not other_ids:
+                continue
+            ref = PoseSampler._best_frame_direction(pos[other_ids] - np.asarray(pos[int(idx)], dtype=float))
+            n = float(np.linalg.norm(ref))
+            if n < 1e-12:
+                continue
+            q = PoseSampler._quaternion_from_two_vectors(ref, np.asarray(normal, dtype=float))
+            if q is None:
+                continue
+            duplicate = any(PoseSampler._quaternion_distance(np.asarray(q, dtype=float), ref_q) <= 1e-6 for ref_q in out)
+            if duplicate:
+                continue
+            out.append(np.asarray(q, dtype=float))
+            if len(out) >= int(max_vectors):
+                break
+        return [np.asarray(q, dtype=float) for q in out]
+
+    @staticmethod
+    def _best_frame_direction(rel_vectors: np.ndarray) -> np.ndarray:
+        rel = np.asarray(rel_vectors, dtype=float)
+        if rel.ndim != 2 or rel.shape[0] == 0:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        norms = np.linalg.norm(rel, axis=1)
+        keep = norms > 1e-12
+        if not np.any(keep):
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        rel_u = rel[keep] / norms[keep][:, None]
+        candidates: list[np.ndarray] = []
+        for i in range(len(rel_u)):
+            candidates.append(np.asarray(rel_u[i], dtype=float))
+        for i in range(len(rel_u)):
+            for j in range(i + 1, len(rel_u)):
+                cand = np.asarray(rel_u[i] + rel_u[j], dtype=float)
+                if float(np.linalg.norm(cand)) > 1e-12:
+                    candidates.append(cand / (np.linalg.norm(cand) + 1e-12))
+        mean_vec = np.mean(rel_u, axis=0)
+        if float(np.linalg.norm(mean_vec)) > 1e-12:
+            candidates.append(mean_vec / (np.linalg.norm(mean_vec) + 1e-12))
+        if not candidates:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        best = None
+        for cand in candidates:
+            c = np.asarray(cand, dtype=float)
+            c = c / (np.linalg.norm(c) + 1e-12)
+            score = float(np.min(rel_u @ c))
+            rank = (-score, -float(np.mean(rel_u @ c)))
+            if best is None or rank < best[0]:
+                best = (rank, c)
+        return np.asarray(best[1], dtype=float) if best is not None else np.array([0.0, 0.0, 1.0], dtype=float)
+
+    @staticmethod
+    def _body_frame_euler_schedule(n_rot: int) -> list[np.ndarray]:
+        n = max(1, int(n_rot))
+        out: list[np.ndarray] = [np.array([0.0, 0.0, 0.0, 1.0], dtype=float)]
+        if n <= 1:
+            return out
+        phi1 = 0.6180339887498948
+        phi2 = 0.4142135623730950
+        for k in range(1, n):
+            u = (float(k) + 0.5) / float(n)
+            alpha = 2.0 * np.pi * ((float(k) * phi1) % 1.0)
+            beta = float(np.arccos(np.clip(1.0 - 2.0 * u, -1.0, 1.0)))
+            gamma = 2.0 * np.pi * ((float(k) * phi2) % 1.0)
+            rz1 = PoseSampler._axis_angle_to_matrix(np.array([0.0, 0.0, 1.0], dtype=float), alpha)
+            ry = PoseSampler._axis_angle_to_matrix(np.array([0.0, 1.0, 0.0], dtype=float), beta)
+            rz2 = PoseSampler._axis_angle_to_matrix(np.array([0.0, 0.0, 1.0], dtype=float), gamma)
+            rot = rz1 @ ry @ rz2
+            quat = PoseSampler._quaternion_from_matrix(rot)
+            if quat is not None:
+                out.append(quat)
+        return out[:n]
+
+    @staticmethod
+    def _reference_tangent(normal: np.ndarray) -> np.ndarray:
+        n = np.asarray(normal, dtype=float)
+        n = n / (np.linalg.norm(n) + 1e-12)
+        ref = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(float(np.dot(ref, n))) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        t = ref - float(np.dot(ref, n)) * n
+        nt = np.linalg.norm(t)
+        if nt < 1e-12:
+            ref = np.array([0.0, 0.0, 1.0], dtype=float)
+            t = ref - float(np.dot(ref, n)) * n
+            nt = np.linalg.norm(t)
+        return t / (nt + 1e-12)
+
+    @staticmethod
+    def _linear_tilt_schedule(n_rot: int) -> list[float]:
+        n = max(1, int(np.ceil(max(1, int(n_rot)) / 2.0)))
+        base = [0.0, 25.0, 50.0, 80.0]
+        if n <= len(base):
+            return base[:n]
+        extra = np.linspace(base[-1], 88.0, num=(n - len(base) + 1), endpoint=True)[1:]
+        return base + [float(v) for v in extra.tolist()]
 
     @staticmethod
     def _quaternion_from_two_vectors(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray | None:
@@ -994,6 +1249,45 @@ class PoseSampler:
         return q / (np.linalg.norm(q) + 1e-12)
 
     @staticmethod
+    def _quaternion_from_matrix(rot: np.ndarray) -> np.ndarray | None:
+        r = np.asarray(rot, dtype=float).reshape(3, 3)
+        trace = float(np.trace(r))
+        if trace > 0.0:
+            s = 2.0 * np.sqrt(trace + 1.0)
+            if s < 1e-12:
+                return None
+            w = 0.25 * s
+            x = (r[2, 1] - r[1, 2]) / s
+            y = (r[0, 2] - r[2, 0]) / s
+            z = (r[1, 0] - r[0, 1]) / s
+        else:
+            diag = np.diag(r)
+            idx = int(np.argmax(diag))
+            if idx == 0:
+                s = 2.0 * np.sqrt(max(1e-16, 1.0 + r[0, 0] - r[1, 1] - r[2, 2]))
+                x = 0.25 * s
+                y = (r[0, 1] + r[1, 0]) / s
+                z = (r[0, 2] + r[2, 0]) / s
+                w = (r[2, 1] - r[1, 2]) / s
+            elif idx == 1:
+                s = 2.0 * np.sqrt(max(1e-16, 1.0 + r[1, 1] - r[0, 0] - r[2, 2]))
+                x = (r[0, 1] + r[1, 0]) / s
+                y = 0.25 * s
+                z = (r[1, 2] + r[2, 1]) / s
+                w = (r[0, 2] - r[2, 0]) / s
+            else:
+                s = 2.0 * np.sqrt(max(1e-16, 1.0 + r[2, 2] - r[0, 0] - r[1, 1]))
+                x = (r[0, 2] + r[2, 0]) / s
+                y = (r[1, 2] + r[2, 1]) / s
+                z = 0.25 * s
+                w = (r[1, 0] - r[0, 1]) / s
+        q = np.array([x, y, z, w], dtype=float)
+        n = float(np.linalg.norm(q))
+        if n < 1e-12:
+            return None
+        return q / n
+
+    @staticmethod
     def _classify_molecule_shape(adsorbate: Atoms) -> str:
         n = len(adsorbate)
         if n <= 1:
@@ -1012,8 +1306,18 @@ class PoseSampler:
 
     @staticmethod
     def _quaternion_distance(q1: np.ndarray, q2: np.ndarray) -> float:
-        dot = float(np.dot(q1, q2))
+        a = np.asarray(q1, dtype=float)
+        b = np.asarray(q2, dtype=float)
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        if na < 1e-12 or nb < 1e-12:
+            return float(np.inf)
+        a = a / na
+        b = b / nb
+        dot = float(np.dot(a, b))
         dot = abs(dot)
+        if dot >= 1.0 - 1e-12:
+            return 0.0
         dot = min(1.0, max(-1.0, dot))
         return 2.0 * float(np.arccos(dot))
 
