@@ -8,16 +8,24 @@ from typing import Any
 
 import numpy as np
 from ase import Atoms
-from ase.build import add_adsorbate, fcc100, fcc110, fcc111, molecule
+from ase.build import fcc100, fcc110, fcc111, molecule
 from ase.io import read, write
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
+from adsorption_ensemble.benchmark import build_ase_reference_frames
 from adsorption_ensemble.basin.dedup import kabsch_rmsd
 from adsorption_ensemble.pose import PoseSamplerConfig
 from adsorption_ensemble.relax.backends import IdentityRelaxBackend, MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.site import PrimitiveEmbeddingConfig
-from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
-from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, run_adsorption_workflow
+from adsorption_ensemble.workflows import (
+    AdsorptionWorkflowConfig,
+    DEFAULT_BASIN_DEDUP_METRIC,
+    DEFAULT_MACE_NODE_L2_THRESHOLD,
+    DEFAULT_SURFACE_TARGET_FRACTION,
+    DEFAULT_SURFACE_TARGET_MODE,
+    make_default_surface_preprocessor,
+    run_adsorption_workflow,
+)
 
 
 def _make_relax_backend(kind: str) -> object:
@@ -36,7 +44,14 @@ def _make_relax_backend(kind: str) -> object:
     )
 
 
-def _workflow_config(work_dir: Path, ads_name: str, *, placement_mode: str = "anchor_free") -> AdsorptionWorkflowConfig:
+def _workflow_config(
+    work_dir: Path,
+    ads_name: str,
+    *,
+    placement_mode: str = "anchor_free",
+    surface_target_mode: str = DEFAULT_SURFACE_TARGET_MODE,
+    surface_target_fraction: float | None = DEFAULT_SURFACE_TARGET_FRACTION,
+) -> AdsorptionWorkflowConfig:
     if ads_name == "H":
         pose_cfg = PoseSamplerConfig(
             placement_mode=str(placement_mode),
@@ -65,33 +80,27 @@ def _workflow_config(work_dir: Path, ads_name: str, *, placement_mode: str = "an
         )
     return AdsorptionWorkflowConfig(
         work_dir=work_dir,
-        surface_preprocessor=SurfacePreprocessor(
-            min_surface_atoms=6,
-            primary_detector=ProbeScanDetector(grid_step=0.6),
-            fallback_detector=VoxelFloodDetector(spacing=0.8),
-            target_surface_fraction=None,
-            target_count_mode="off",
+        surface_preprocessor=make_default_surface_preprocessor(
+            target_count_mode=str(surface_target_mode),
+            target_surface_fraction=surface_target_fraction,
         ),
         pose_sampler_config=pose_cfg,
         basin_config=BasinConfig(
             relax_maxf=0.1,
             relax_steps=80,
             energy_window_ev=2.5,
-            dedup_metric="binding_surface_distance",
+            dedup_metric=DEFAULT_BASIN_DEDUP_METRIC,
             signature_mode="provenance",
-            dedup_cluster_method="greedy",
+            dedup_cluster_method="hierarchical",
             rmsd_threshold=0.10,
-            surface_descriptor_threshold=0.30,
-            surface_descriptor_nearest_k=8,
-            surface_descriptor_atom_mode="binding_only",
-            surface_descriptor_relative=False,
-            surface_descriptor_rmsd_gate=0.25,
             mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
             mace_device="cuda",
             mace_dtype="float32",
+            mace_enable_cueq=True,
             mace_head_name="omat_pbe",
-            final_basin_merge_metric="mace_node_l2",
-            final_basin_merge_node_l2_threshold=0.20,
+            mace_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
+            final_basin_merge_metric="off",
+            final_basin_merge_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
             final_basin_merge_cluster_method="hierarchical",
             desorption_min_bonds=1,
             work_dir=None,
@@ -110,21 +119,18 @@ def _manual_basin_config(work_dir: Path) -> BasinConfig:
         relax_maxf=0.1,
         relax_steps=80,
         energy_window_ev=2.5,
-        dedup_metric="binding_surface_distance",
+        dedup_metric=DEFAULT_BASIN_DEDUP_METRIC,
         signature_mode="provenance",
-        dedup_cluster_method="greedy",
+        dedup_cluster_method="hierarchical",
         rmsd_threshold=0.10,
-        surface_descriptor_threshold=0.30,
-        surface_descriptor_nearest_k=8,
-        surface_descriptor_atom_mode="binding_only",
-        surface_descriptor_relative=False,
-        surface_descriptor_rmsd_gate=0.25,
         mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
         mace_device="cuda",
         mace_dtype="float32",
+        mace_enable_cueq=True,
         mace_head_name="omat_pbe",
-        final_basin_merge_metric="mace_node_l2",
-        final_basin_merge_node_l2_threshold=0.20,
+        mace_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
+        final_basin_merge_metric="off",
+        final_basin_merge_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
         final_basin_merge_cluster_method="hierarchical",
         desorption_min_bonds=1,
         work_dir=work_dir,
@@ -155,35 +161,9 @@ def _build_cases() -> list[dict[str, Any]]:
     return out
 
 
-def _manual_height(ads_name: str, site_name: str) -> float:
-    if ads_name == "H":
-        if site_name in {"hollow", "fcc", "hcp"}:
-            return 0.9
-        if "bridge" in site_name:
-            return 1.0
-        return 1.1
-    if site_name in {"hollow", "fcc", "hcp"}:
-        return 1.6
-    if "bridge" in site_name:
-        return 1.75
-    return 1.85
-
-
 def _manual_frames_for_ase_sites(slab: Atoms, ads_name: str) -> tuple[list[Atoms], list[dict[str, Any]]]:
-    info = slab.info.get("adsorbate_info", {})
-    sites = info.get("sites", {}) if isinstance(info, dict) else {}
-    frames = []
-    meta = []
     ads = _make_adsorbate(ads_name)
-    for site_name in sites.keys():
-        placed = slab.copy()
-        add_adsorbate(placed, ads.copy(), _manual_height(ads_name, str(site_name).lower()), str(site_name))
-        placed.info["generator"] = "ase_manual"
-        placed.info["site_name"] = str(site_name)
-        placed.info["site_label"] = str(site_name).lower()
-        frames.append(placed)
-        meta.append({"site_name": str(site_name)})
-    return frames, meta
+    return build_ase_reference_frames(slab=slab, adsorbate=ads)
 
 
 def _load_basins(extxyz_path: str | None) -> list[Atoms]:
@@ -221,11 +201,25 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
         if best is not None and float(best[1]["rmsd"]) <= float(rmsd_threshold):
             matched += 1
             matches.append(best[1])
+    n_manual = int(len(manual_basins))
+    n_ours = int(len(ours_basins))
+    recall: float | None
+    reference_state: str
+    if n_manual <= 0 and n_ours <= 0:
+        recall = None
+        reference_state = "empty_agreement"
+    elif n_manual <= 0:
+        recall = None
+        reference_state = "empty_reference_ours_positive"
+    else:
+        recall = float(matched / max(1, n_manual))
+        reference_state = "manual_positive"
     return {
         "matched_manual_basins": int(matched),
-        "n_manual_basins": int(len(manual_basins)),
-        "n_ours_basins": int(len(ours_basins)),
-        "manual_recall_by_ours": float(matched / max(1, len(manual_basins))),
+        "n_manual_basins": int(n_manual),
+        "n_ours_basins": int(n_ours),
+        "manual_recall_by_ours": recall,
+        "manual_reference_state": str(reference_state),
         "matches": matches,
     }
 
@@ -236,6 +230,8 @@ def main() -> int:
     parser.add_argument("--max-cases", type=int, default=0)
     parser.add_argument("--relax-backend", type=str, default="mace", choices=["mace", "fake"])
     parser.add_argument("--placement-mode", type=str, default="anchor_free", choices=["anchor_free", "anchor_aware"])
+    parser.add_argument("--surface-target-mode", type=str, default=DEFAULT_SURFACE_TARGET_MODE)
+    parser.add_argument("--surface-target-fraction", type=float, default=DEFAULT_SURFACE_TARGET_FRACTION)
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
@@ -253,7 +249,15 @@ def main() -> int:
         ads_name = str(case["ads_name"])
         ads = _make_adsorbate(ads_name)
 
-        ours_cfg = _workflow_config(case_dir / "ours", ads_name=ads_name, placement_mode=str(args.placement_mode))
+        ours_cfg = _workflow_config(
+            case_dir / "ours",
+            ads_name=ads_name,
+            placement_mode=str(args.placement_mode),
+            surface_target_mode=str(args.surface_target_mode),
+            surface_target_fraction=None
+            if args.surface_target_fraction is None
+            else float(args.surface_target_fraction),
+        )
         ours_result = run_adsorption_workflow(
             slab=slab,
             adsorbate=ads,
@@ -278,12 +282,16 @@ def main() -> int:
             a.info["basin_id"] = int(basin.basin_id)
             a.info["energy_ev"] = float(basin.energy_ev)
             manual_basins.append(a)
+        if manual_frames:
+            write((case_dir / "ase_manual" / "manual_input_frames.extxyz").as_posix(), manual_frames)
         if manual_basins:
             write((case_dir / "ase_manual" / "manual_basins.extxyz").as_posix(), manual_basins)
         (case_dir / "ase_manual" / "manual_basin_summary.json").write_text(
             json.dumps(
                 {
                     "manual_sites": manual_meta,
+                    "binding_atom_index": int(manual_meta[0]["binding_atom_index"]) if manual_meta else None,
+                    "binding_atom_symbol": (None if not manual_meta else str(manual_meta[0]["binding_atom_symbol"])),
                     "summary": manual_result.summary,
                     "rejected": [{"candidate_id": int(r.candidate_id), "reason": str(r.reason), "metrics": dict(r.metrics)} for r in manual_result.rejected],
                 },
@@ -304,6 +312,10 @@ def main() -> int:
                     "n_pose_frames": int(ours_result.summary["n_pose_frames"]),
                     "n_basins": int(ours_result.summary["n_basins"]),
                     "placement_mode": str(args.placement_mode),
+                    "surface_target_mode": str(args.surface_target_mode),
+                    "surface_target_fraction": (
+                        None if args.surface_target_fraction is None else float(args.surface_target_fraction)
+                    ),
                     "work_dir": (case_dir / "ours").as_posix(),
                 },
                 "ase_manual": {
@@ -320,6 +332,8 @@ def main() -> int:
         "out_root": out_root.as_posix(),
         "relax_backend": str(args.relax_backend),
         "placement_mode": str(args.placement_mode),
+        "surface_target_mode": str(args.surface_target_mode),
+        "surface_target_fraction": (None if args.surface_target_fraction is None else float(args.surface_target_fraction)),
         "mace_model_path": ("/root/.cache/mace/mace-omat-0-small.model" if str(args.relax_backend) == "mace" else None),
         "rows": rows,
     }

@@ -92,7 +92,11 @@ def analyze_case_row(row: dict[str, Any]) -> dict[str, Any]:
         "n_matched_manual_basins": int(matched_manual),
         "n_missing_manual_basins": int(max(0, n_manual - matched_manual)),
         "n_extra_ours_basins": int(len(extra_ours_basins)),
-        "manual_recall_by_ours": float(overlap.get("manual_recall_by_ours", 0.0)),
+        "manual_recall_by_ours": (
+            None
+            if overlap.get("manual_recall_by_ours", None) is None
+            else float(overlap.get("manual_recall_by_ours"))
+        ),
         "extra_ours_basins": extra_ours_basins,
     }
 
@@ -138,10 +142,11 @@ def write_audit_report(audit: dict[str, Any], out_root: Path) -> tuple[Path, Pat
         "",
     ]
     for case in audit["case_audits"]:
+        recall_text = "NA" if case["manual_recall_by_ours"] is None else f"{float(case['manual_recall_by_ours']):.3f}"
         lines.append(
             f"- {case['case']}: manual {case['n_manual_basins']}, ours {case['n_ours_basins']}, "
             f"missing {case['n_missing_manual_basins']}, extra {case['n_extra_ours_basins']}, "
-            f"recall {case['manual_recall_by_ours']:.3f}"
+            f"recall {recall_text}"
         )
         for basin in case["extra_ours_basins"]:
             lines.append(

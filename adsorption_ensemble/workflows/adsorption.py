@@ -96,12 +96,12 @@ def run_adsorption_workflow(
 
     artifacts: dict[str, str] = {}
     if bool(cfg.save_raw_site_dictionary):
-        raw_site_dictionary = build_site_dictionary(embed_result.primitives)
+        raw_site_dictionary = build_site_dictionary(embed_result.primitives, slab=slab)
         raw_site_dictionary_path = work_dir / "raw_site_dictionary.json"
         _write_json(raw_site_dictionary_path, raw_site_dictionary)
         artifacts["raw_site_dictionary_json"] = raw_site_dictionary_path.as_posix()
     if bool(cfg.save_selected_site_dictionary):
-        selected_site_dictionary = build_site_dictionary(primitives)
+        selected_site_dictionary = build_site_dictionary(primitives, slab=slab)
         selected_site_dictionary_path = work_dir / "selected_site_dictionary.json"
         _write_json(selected_site_dictionary_path, selected_site_dictionary)
         artifacts["selected_site_dictionary_json"] = selected_site_dictionary_path.as_posix()
@@ -291,6 +291,15 @@ def run_adsorption_workflow(
 
     summary = {
         "n_surface_atoms": int(len(ctx.detection.surface_atom_ids)),
+        "surface_atom_ids": [int(i) for i in ctx.detection.surface_atom_ids],
+        "surface_classification": {
+            "is_slab": bool(ctx.classification.is_slab),
+            "normal_axis": (None if ctx.classification.normal_axis is None else int(ctx.classification.normal_axis)),
+            "vacuum_lengths": [float(x) for x in ctx.classification.vacuum_lengths],
+            "confidence": float(ctx.classification.confidence),
+            "method": str(ctx.classification.method),
+        },
+        "surface_diagnostics": dict(ctx.detection.diagnostics),
         "n_primitives": int(len(primitives)),
         "n_raw_primitives": int(len(embed_result.primitives)),
         "n_basis_primitives": int(len(embed_result.basis_primitives)),

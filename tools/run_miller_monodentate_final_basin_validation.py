@@ -8,15 +8,16 @@ from typing import Any
 
 import numpy as np
 from ase import Atoms
-from ase.build import add_adsorbate
 from ase.io import read, write
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
-from adsorption_ensemble.benchmark import audit_cu111_co_case
+from adsorption_ensemble.benchmark import audit_cu111_co_case, build_ase_reference_frames
 from adsorption_ensemble.basin.dedup import symmetry_aware_kabsch_rmsd
-from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
+from adsorption_ensemble.pose import PoseSampler
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.workflows import (
+    DEFAULT_BASIN_DEDUP_METRIC,
+    DEFAULT_MACE_NODE_L2_THRESHOLD,
     generate_adsorption_ensemble,
     list_sampling_schedule_presets,
     make_sampling_schedule,
@@ -50,9 +51,11 @@ def _manual_basin_config(work_dir: Path, *, dedup_metric: str, signature_mode: s
         mace_model_path="/root/.cache/mace/mace-omat-0-small.model",
         mace_device="cuda",
         mace_dtype="float32",
+        mace_enable_cueq=True,
         mace_head_name="omat_pbe",
-        final_basin_merge_metric="mace_node_l2",
-        final_basin_merge_node_l2_threshold=0.20,
+        mace_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
+        final_basin_merge_metric="off",
+        final_basin_merge_node_l2_threshold=DEFAULT_MACE_NODE_L2_THRESHOLD,
         final_basin_merge_cluster_method="hierarchical",
         desorption_min_bonds=1,
         post_relax_selection=post_relax_selection,
@@ -60,51 +63,17 @@ def _manual_basin_config(work_dir: Path, *, dedup_metric: str, signature_mode: s
     )
 
 
-def _manual_height(adsorbate: Atoms, site_name: str) -> float:
-    lname = str(site_name).lower()
-    if len(adsorbate) == 1:
-        if lname in {"hollow", "fcc", "hcp"}:
-            return 0.9
-        if "bridge" in lname:
-            return 1.0
-        return 1.1
-    sampler = PoseSampler(PoseSamplerConfig())
-    mol_class = sampler._classify_molecule_shape(adsorbate)
-    coord = 1
-    if "bridge" in lname:
-        coord = 2
-    elif lname in {"hollow", "fcc", "hcp"}:
-        coord = 3
-    base_floor = float(sampler._preferred_min_height(mol_class=mol_class, site_coordination=coord))
-    if coord <= 1:
-        return max(base_floor, 1.85)
-    if coord == 2:
-        return max(base_floor, 1.70)
-    return max(base_floor, 1.55)
-
-
 def _manual_frames_for_ase_sites(slab: Atoms, adsorbate: Atoms) -> tuple[list[Atoms], list[dict[str, Any]]]:
-    info = slab.info.get("adsorbate_info", {})
-    sites = info.get("sites", {}) if isinstance(info, dict) else {}
-    frames = []
-    meta = []
-    origin_index = int(PoseSampler._select_adsorption_origin_index(adsorbate))
-    for site_name in sites.keys():
-        placed = slab.copy()
-        add_adsorbate(
-            placed,
-            adsorbate.copy(),
-            _manual_height(adsorbate, str(site_name)),
-            str(site_name),
-            mol_index=origin_index,
-        )
-        placed.info["generator"] = "ase_manual"
-        placed.info["site_name"] = str(site_name)
-        placed.info["site_label"] = str(site_name).lower()
-        placed.info["mol_index"] = int(origin_index)
-        frames.append(placed)
-        meta.append({"site_name": str(site_name), "mol_index": int(origin_index)})
-    return frames, meta
+    return build_ase_reference_frames(slab=slab, adsorbate=adsorbate)
+
+
+def _reference_source_from_meta(meta: list[dict[str, Any]]) -> str:
+    sources = sorted({str(row.get("reference_source", "")).strip() for row in meta if str(row.get("reference_source", "")).strip()})
+    if not sources:
+        return ""
+    if len(sources) == 1:
+        return str(sources[0])
+    return "mixed"
 
 
 def _load_basins(extxyz_path: str | None) -> list[Atoms]:
@@ -143,11 +112,25 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
         if best is not None and float(best[1]["rmsd"]) <= float(rmsd_threshold):
             matched += 1
             matches.append(best[1])
+    n_manual = int(len(manual_basins))
+    n_ours = int(len(ours_basins))
+    recall: float | None
+    reference_state: str
+    if n_manual <= 0 and n_ours <= 0:
+        recall = None
+        reference_state = "empty_agreement"
+    elif n_manual <= 0:
+        recall = None
+        reference_state = "empty_reference_ours_positive"
+    else:
+        recall = float(matched / max(1, n_manual))
+        reference_state = "manual_positive"
     return {
         "matched_manual_basins": int(matched),
-        "n_manual_basins": int(len(manual_basins)),
-        "n_ours_basins": int(len(ours_basins)),
-        "manual_recall_by_ours": float(matched / max(1, len(manual_basins))),
+        "n_manual_basins": int(n_manual),
+        "n_ours_basins": int(n_ours),
+        "manual_recall_by_ours": recall,
+        "manual_reference_state": str(reference_state),
         "matches": matches,
     }
 
@@ -198,8 +181,9 @@ def run(args: argparse.Namespace) -> Path:
                     "mace_device": "cuda",
                     "mace_dtype": "float32",
                     "mace_head_name": "omat_pbe",
-                    "final_basin_merge_metric": "mace_node_l2",
-                    "final_basin_merge_node_l2_threshold": 0.20,
+                    "mace_node_l2_threshold": DEFAULT_MACE_NODE_L2_THRESHOLD,
+                    "final_basin_merge_metric": "off",
+                    "final_basin_merge_node_l2_threshold": DEFAULT_MACE_NODE_L2_THRESHOLD,
                     "final_basin_merge_cluster_method": "hierarchical",
                 },
                 basin_relax_backend=relax_backend,
@@ -227,12 +211,17 @@ def run(args: argparse.Namespace) -> Path:
                 a.info["basin_id"] = int(basin.basin_id)
                 a.info["energy_ev"] = float(basin.energy_ev)
                 manual_basins.append(a)
+            if manual_frames:
+                write((case_dir / "ase_manual" / "manual_input_frames.extxyz").as_posix(), manual_frames)
             if manual_basins:
                 write((case_dir / "ase_manual" / "manual_basins.extxyz").as_posix(), manual_basins)
             _write_json(
                 case_dir / "ase_manual" / "manual_basin_summary.json",
                 {
+                    "reference_source": _reference_source_from_meta(manual_meta),
                     "manual_sites": manual_meta,
+                    "binding_atom_index": int(manual_meta[0]["binding_atom_index"]) if manual_meta else None,
+                    "binding_atom_symbol": (None if not manual_meta else str(manual_meta[0]["binding_atom_symbol"])),
                     "summary": manual_result.summary,
                     "rejected": [{"candidate_id": int(r.candidate_id), "reason": str(r.reason), "metrics": dict(r.metrics)} for r in manual_result.rejected],
                 },
@@ -254,6 +243,7 @@ def run(args: argparse.Namespace) -> Path:
                         "work_dir": (case_dir / "ours").as_posix(),
                     },
                     "ase_manual": {
+                        "reference_source": _reference_source_from_meta(manual_meta),
                         "n_input_sites": int(len(manual_frames)),
                         "n_basins": int(len(manual_basins)),
                         "rejected_reason_counts": dict({str(k): int(v) for k, v in Counter(str(r.reason) for r in manual_result.rejected).items()}),
@@ -268,11 +258,26 @@ def run(args: argparse.Namespace) -> Path:
                 rows[-1]["sentinel_audit"] = sentinel
             _write_json(case_dir / "case_summary.json", rows[-1])
 
-    recalls = [float(r["overlap"]["manual_recall_by_ours"]) for r in rows]
+    recalls = [
+        float(r["overlap"]["manual_recall_by_ours"])
+        for r in rows
+        if r["overlap"].get("manual_recall_by_ours", None) is not None
+    ]
     total_pose_frames = int(sum(int(r["ours"]["n_pose_frames"]) for r in rows))
     total_pose_frames_selected_for_basin = int(sum(int(r["ours"]["n_pose_frames_selected_for_basin"]) for r in rows))
     total_ours_basins = int(sum(int(r["ours"]["n_basins"]) for r in rows))
     total_manual_basins = int(sum(int(r["ase_manual"]["n_basins"]) for r in rows))
+    empty_reference_rows = [dict(r) for r in rows if int(r["ase_manual"]["n_basins"]) <= 0]
+    empty_reference_agreement_rows = [
+        dict(r)
+        for r in rows
+        if str(r["overlap"].get("manual_reference_state", "")) == "empty_agreement"
+    ]
+    empty_reference_ours_positive_rows = [
+        dict(r)
+        for r in rows
+        if str(r["overlap"].get("manual_reference_state", "")) == "empty_reference_ours_positive"
+    ]
     sentinel_rows = [dict(r) for r in rows if isinstance(r.get("sentinel_audit"), dict)]
     suspicious_rows = [
         dict(r)
@@ -292,9 +297,13 @@ def run(args: argparse.Namespace) -> Path:
         "total_pose_frames_selected_for_basin": int(total_pose_frames_selected_for_basin),
         "total_ours_basins": int(total_ours_basins),
         "total_manual_basins": int(total_manual_basins),
+        "n_recall_defined_cases": int(len(recalls)),
         "mean_manual_recall_by_ours": (None if not recalls else float(np.mean(recalls))),
         "min_manual_recall_by_ours": (None if not recalls else float(np.min(recalls))),
         "n_full_recall": int(sum(1 for v in recalls if abs(v - 1.0) <= 1e-12)),
+        "n_empty_reference_cases": int(len(empty_reference_rows)),
+        "n_empty_reference_agreement_cases": int(len(empty_reference_agreement_rows)),
+        "n_empty_reference_ours_positive_cases": int(len(empty_reference_ours_positive_rows)),
         "n_sentinel_cases": int(len(sentinel_rows)),
         "n_suspicious_hollow_collapse_cases": int(len(suspicious_rows)),
         "suspicious_hollow_collapse_cases": [
@@ -323,7 +332,7 @@ def main() -> int:
     parser.add_argument("--max-slabs", type=int, default=0)
     parser.add_argument("--max-molecules", type=int, default=0)
     parser.add_argument("--rmsd-threshold", type=float, default=0.20)
-    parser.add_argument("--dedup-metric", type=str, default="binding_surface_distance")
+    parser.add_argument("--dedup-metric", type=str, default=DEFAULT_BASIN_DEDUP_METRIC)
     parser.add_argument("--signature-mode", type=str, default="provenance", choices=["absolute", "canonical", "provenance", "none"])
     parser.add_argument("--placement-mode", type=str, default="anchor_free", choices=["anchor_free", "anchor_aware"])
     parser.add_argument("--schedule-preset", type=str, default="multistage_default", choices=list_sampling_schedule_presets())
