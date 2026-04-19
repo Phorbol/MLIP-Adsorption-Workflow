@@ -50,6 +50,7 @@ class MACEInferenceConfig:
     model_path: str | None = None
     device: str = "cpu"
     dtype: str = "float32"
+    enable_cueq: bool = False
     max_edges_per_batch: int = 15000
     num_workers: int = 1
     layers_to_keep: int = -1

@@ -88,9 +88,9 @@ class PoseSweepConfig:
     ensemble_relax_maxf: float = 0.10
     ensemble_relax_steps: int = 80
     ensemble_energy_window_ev: float = 3.0
-    ensemble_dedup_metric: str = "rmsd"
+    ensemble_dedup_metric: str = "mace_node_l2"
     ensemble_rmsd_threshold: float = 0.10
-    ensemble_mace_node_l2_threshold: float = 2.0
+    ensemble_mace_node_l2_threshold: float = 0.20
     ensemble_binding_tau: float = 1.15
     ensemble_desorption_min_bonds: int = 1
     ensemble_surface_reconstruction_max_disp: float = 0.50
@@ -1201,7 +1201,7 @@ def run_pose_sampling_sweep(
         plot_site_centers_only(slab, emb_res.primitives, slab_dir / "sites_only.png")
         plot_inequivalent_sites_2d(slab, emb_res.primitives, slab_dir / "sites_inequivalent.png")
         plot_site_embedding_pca(emb_res.primitives, slab_dir / "site_embedding_pca.png")
-        site_dict = build_site_dictionary(emb_res.primitives)
+        site_dict = build_site_dictionary(emb_res.primitives, slab=slab)
         (slab_dir / "site_dictionary.json").write_text(json.dumps(site_dict, ensure_ascii=False, indent=2), encoding="utf-8")
         t_slab_viz_io = float(perf_counter() - t0)
         for mol_name in mol_names:

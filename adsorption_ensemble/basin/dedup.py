@@ -71,6 +71,7 @@ def binding_signature(
     *,
     frame: Atoms | None = None,
     slab_n: int | None = None,
+    surface_reference: Atoms | None = None,
     mode: str = "absolute",
 ) -> str:
     mode_norm = str(mode).strip().lower()
@@ -94,6 +95,15 @@ def binding_signature(
         tokens = []
         for i, j in sorted(binding_pairs):
             env = _surface_atom_environment_signature(frame=frame, slab_n=int(slab_n), slab_atom_index=int(j))
+            tokens.append(f"{int(i)}:{env}")
+        payload = ",".join(tokens).encode("utf-8")
+    elif mode_norm in {"reference_canonical", "ref_canonical", "canonical_reference", "surface_reference_canonical"}:
+        ref_frame = surface_reference
+        if ref_frame is None or slab_n is None:
+            raise ValueError("reference_canonical binding_signature requires surface_reference and slab_n.")
+        tokens = []
+        for i, j in sorted(binding_pairs):
+            env = _surface_atom_environment_signature(frame=ref_frame, slab_n=int(slab_n), slab_atom_index=int(j))
             tokens.append(f"{int(i)}:{env}")
         payload = ",".join(tokens).encode("utf-8")
     else:
@@ -299,6 +309,96 @@ def mean_atomwise_l2(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b, axis=1).mean())
 
 
+def _extract_adsorbate_node_descriptor(
+    frame: Atoms,
+    node_desc: np.ndarray | None,
+    *,
+    slab_n: int,
+) -> tuple[Atoms | None, np.ndarray | None]:
+    if node_desc is None:
+        return None, None
+    arr = np.asarray(node_desc, dtype=float)
+    if arr.ndim != 2:
+        return None, None
+    n_total = len(frame)
+    ads_n = int(n_total) - int(slab_n)
+    if ads_n < 0:
+        return None, None
+    if arr.shape[0] == n_total:
+        arr_ads = np.asarray(arr[int(slab_n) :], dtype=float)
+    elif arr.shape[0] == ads_n:
+        arr_ads = np.asarray(arr, dtype=float)
+    else:
+        return None, None
+    return frame[int(slab_n) :].copy(), arr_ads
+
+
+def _canonicalize_adsorbate_node_descriptor(
+    frame: Atoms,
+    node_desc: np.ndarray | None,
+    *,
+    slab_n: int,
+    bond_tau: float = 1.20,
+) -> tuple[np.ndarray | None, list[list[int]] | None, tuple[int, ...] | None]:
+    adsorbate, ads_desc = _extract_adsorbate_node_descriptor(frame=frame, node_desc=node_desc, slab_n=int(slab_n))
+    if adsorbate is None or ads_desc is None:
+        return None, None, None
+    from adsorption_ensemble.node.canonicalize import build_internal_bonds, canonicalize_adsorbate_order
+
+    z = [int(v) for v in np.asarray(adsorbate.get_atomic_numbers(), dtype=int).tolist()]
+    bonds = build_internal_bonds(adsorbate=adsorbate, bond_tau=float(bond_tau))
+    order = canonicalize_adsorbate_order(z, bonds, n_iter=None)
+    arr = np.asarray(ads_desc, dtype=float)
+    if len(order) != arr.shape[0]:
+        return None, None, None
+    arr_can = np.asarray(arr[np.asarray(order, dtype=int)], dtype=float)
+    ads_can = adsorbate[np.asarray(order, dtype=int)]
+    groups = _atom_class_groups(ads_can, bond_tau=float(bond_tau))
+    z_can = tuple(int(v) for v in np.asarray(ads_can.get_atomic_numbers(), dtype=int).tolist())
+    return arr_can, groups, z_can
+
+
+def _assigned_adsorbate_node_l2(
+    a_desc: np.ndarray | None,
+    a_groups: list[list[int]] | None,
+    a_z: tuple[int, ...] | None,
+    b_desc: np.ndarray | None,
+    b_groups: list[list[int]] | None,
+    b_z: tuple[int, ...] | None,
+    *,
+    l2_mode: str,
+) -> float:
+    if a_desc is None or b_desc is None or a_groups is None or b_groups is None or a_z is None or b_z is None:
+        return float("nan")
+    xa = np.asarray(a_desc, dtype=float)
+    xb = np.asarray(b_desc, dtype=float)
+    if xa.shape != xb.shape or xa.ndim != 2 or tuple(a_z) != tuple(b_z) or len(a_groups) != len(b_groups):
+        return float("nan")
+    matched_costs: list[float] = []
+    for ga, gb in zip(a_groups, b_groups):
+        if len(ga) != len(gb):
+            return float("nan")
+        ga_arr = np.asarray(ga, dtype=int)
+        gb_arr = np.asarray(gb, dtype=int)
+        block_a = np.asarray(xa[ga_arr], dtype=float)
+        block_b = np.asarray(xb[gb_arr], dtype=float)
+        if block_a.shape != block_b.shape:
+            return float("nan")
+        if block_a.shape[0] <= 1:
+            matched_costs.extend(np.linalg.norm(block_a - block_b, axis=1).tolist())
+            continue
+        cost = np.linalg.norm(block_a[:, None, :] - block_b[None, :, :], axis=2)
+        row_ind, col_ind = linear_sum_assignment(cost)
+        matched_costs.extend(cost[row_ind, col_ind].tolist())
+    if not matched_costs:
+        return 0.0
+    total = float(np.sum(np.asarray(matched_costs, dtype=float)))
+    mode_norm = str(l2_mode).strip().lower()
+    if mode_norm in {"sum", "sum_atom", "sum_atomwise"}:
+        return total
+    return float(total / max(1, len(matched_costs)))
+
+
 def _pairwise_distance_matrix(items: list[dict], distance_fn: Callable[[dict, dict], float]) -> np.ndarray:
     n = len(items)
     if n <= 0:
@@ -426,11 +526,18 @@ def _group_items_by_signature(
     binding_tau: float,
     *,
     signature_mode: str = "absolute",
+    surface_reference: Atoms | None = None,
 ) -> dict[str, list[dict]]:
     items: list[dict] = []
     for i, atoms in enumerate(frames):
         pairs = build_binding_pairs(atoms, slab_n=slab_n, binding_tau=binding_tau)
-        sig = binding_signature(pairs, frame=atoms, slab_n=slab_n, mode=str(signature_mode))
+        sig = binding_signature(
+            pairs,
+            frame=atoms,
+            slab_n=slab_n,
+            surface_reference=surface_reference,
+            mode=str(signature_mode),
+        )
         items.append(
             {
                 "candidate_id": int(i),
@@ -594,6 +701,9 @@ def cluster_by_signature_and_mace_node_l2(
     node_descriptors: list[np.ndarray | None] | None = None,
     signature_mode: str = "absolute",
     use_signature_grouping: bool = True,
+    surface_reference: Atoms | None = None,
+    mace_enable_cueq: bool = False,
+    energy_gate_ev: float | None = None,
 ) -> tuple[list[dict], dict]:
     if node_descriptors is None:
         from adsorption_ensemble.relax.backends import normalize_mace_descriptor_config
@@ -610,6 +720,7 @@ def cluster_by_signature_and_mace_node_l2(
             model_path=str(model_path_use) if model_path_use else None,
             device=str(device_use),
             dtype=str(dtype_use),
+            enable_cueq=bool(mace_enable_cueq),
             max_edges_per_batch=int(mace_max_edges_per_batch),
             num_workers=1,
             layers_to_keep=int(mace_layers_to_keep),
@@ -626,6 +737,7 @@ def cluster_by_signature_and_mace_node_l2(
         slab_n=slab_n,
         binding_tau=binding_tau,
         signature_mode=str(signature_mode),
+        surface_reference=surface_reference,
     )
     if not bool(use_signature_grouping):
         flat = []
@@ -639,9 +751,19 @@ def cluster_by_signature_and_mace_node_l2(
     for it in flat_items:
         cid = int(it["candidate_id"])
         it["node_desc"] = (node_descriptors[cid] if node_descriptors is not None and cid < len(node_descriptors) else None)
+        ads_desc_can, ads_groups, ads_z = _canonicalize_adsorbate_node_descriptor(
+            frame=it["atoms"],
+            node_desc=it.get("node_desc"),
+            slab_n=int(slab_n),
+        )
+        it["ads_node_desc"] = ads_desc_can
+        it["ads_node_groups"] = ads_groups
+        it["ads_atomic_numbers"] = ads_z
 
     l2_mode_norm = str(l2_mode).strip().lower()
-    l2_fn = sum_atomwise_l2 if l2_mode_norm in {"sum", "sum_atom", "sum_atomwise"} else mean_atomwise_l2
+    energy_gate = None
+    if energy_gate_ev is not None and np.isfinite(float(energy_gate_ev)):
+        energy_gate = float(energy_gate_ev)
     basins: list[dict] = []
     basin_id = 0
     for sig, group in by_sig.items():
@@ -649,9 +771,30 @@ def cluster_by_signature_and_mace_node_l2(
         clusters = _cluster_group_by_distance(
             group=group,
             distance_fn=lambda a, b: (
-                float("nan")
-                if a.get("node_desc") is None or b.get("node_desc") is None
-                else float(l2_fn(a["node_desc"], b["node_desc"]))
+                float("inf")
+                if (
+                    energy_gate is not None
+                    and (
+                        not np.isfinite(float(a.get("energy", float("nan"))))
+                        or not np.isfinite(float(b.get("energy", float("nan"))))
+                        or abs(float(a["energy"]) - float(b["energy"])) > energy_gate
+                    )
+                )
+                else (
+                    float("nan")
+                    if a.get("ads_node_desc") is None or b.get("ads_node_desc") is None
+                    else float(
+                        _assigned_adsorbate_node_l2(
+                            a.get("ads_node_desc"),
+                            a.get("ads_node_groups"),
+                            a.get("ads_atomic_numbers"),
+                            b.get("ads_node_desc"),
+                            b.get("ads_node_groups"),
+                            b.get("ads_atomic_numbers"),
+                            l2_mode=str(l2_mode_norm),
+                        )
+                    )
+                )
             ),
             threshold=float(node_l2_threshold),
             cluster_method=str(cluster_method),
@@ -685,6 +828,9 @@ def cluster_by_signature_and_mace_node_l2(
     meta["node_l2_threshold"] = float(node_l2_threshold)
     meta["signature_mode"] = str(signature_mode)
     meta["use_signature_grouping"] = bool(use_signature_grouping)
+    meta["descriptor_compare_mode"] = "adsorbate_canonical_assignment"
+    meta["enable_cueq"] = bool(mace_enable_cueq)
+    meta["energy_gate_ev"] = (None if energy_gate is None else float(energy_gate))
     return basins, meta
 
 
@@ -706,14 +852,23 @@ def merge_basin_representatives_by_mace_node_l2(
     fuzzy_sigma_scale: float = 1.5,
     fuzzy_membership_cutoff: float = 0.5,
     node_descriptors: list[np.ndarray | None] | None = None,
+    signature_mode: str = "none",
+    use_signature_grouping: bool = False,
+    surface_reference: Atoms | None = None,
+    mace_enable_cueq: bool = False,
+    energy_gate_ev: float | None = None,
 ) -> tuple[list[dict], dict]:
     if not basins:
         return [], {
-            "metric": "pure_mace",
+            "metric": "mace_node_l2",
             "n_input_basins": 0,
             "n_output_basins": 0,
             "node_l2_threshold": float(node_l2_threshold),
             "cluster_method": str(cluster_method),
+            "signature_mode": str(signature_mode),
+            "use_signature_grouping": bool(use_signature_grouping),
+            "enable_cueq": bool(mace_enable_cueq),
+            "energy_gate_ev": (None if energy_gate_ev is None else float(energy_gate_ev)),
         }
     rep_frames = [dict(b)["atoms"] for b in basins]
     rep_energies = np.asarray(
@@ -729,6 +884,7 @@ def merge_basin_representatives_by_mace_node_l2(
         mace_model_path=mace_model_path,
         mace_device=str(mace_device),
         mace_dtype=str(mace_dtype),
+        mace_enable_cueq=bool(mace_enable_cueq),
         mace_max_edges_per_batch=int(mace_max_edges_per_batch),
         mace_layers_to_keep=int(mace_layers_to_keep),
         mace_head_name=mace_head_name,
@@ -738,8 +894,10 @@ def merge_basin_representatives_by_mace_node_l2(
         fuzzy_sigma_scale=float(fuzzy_sigma_scale),
         fuzzy_membership_cutoff=float(fuzzy_membership_cutoff),
         node_descriptors=node_descriptors,
-        signature_mode="none",
-        use_signature_grouping=False,
+        signature_mode=str(signature_mode),
+        use_signature_grouping=bool(use_signature_grouping),
+        surface_reference=surface_reference,
+        energy_gate_ev=energy_gate_ev,
     )
     merged_basins: list[dict] = []
     for merged in merged_reps:
@@ -770,9 +928,13 @@ def merge_basin_representatives_by_mace_node_l2(
             }
         )
     meta = dict(meta)
-    meta["metric"] = "pure_mace"
+    meta["metric"] = "mace_node_l2"
     meta["n_input_basins"] = int(len(basins))
     meta["n_output_basins"] = int(len(merged_basins))
+    meta["signature_mode"] = str(signature_mode)
+    meta["use_signature_grouping"] = bool(use_signature_grouping)
+    meta["enable_cueq"] = bool(mace_enable_cueq)
+    meta["energy_gate_ev"] = (None if energy_gate_ev is None else float(energy_gate_ev))
     return merged_basins, meta
 
 
@@ -782,6 +944,7 @@ def cluster_by_signature_only(
     slab_n: int,
     binding_tau: float,
     signature_mode: str = "absolute",
+    surface_reference: Atoms | None = None,
 ) -> list[dict]:
     by_sig = _group_items_by_signature(
         frames=frames,
@@ -789,6 +952,7 @@ def cluster_by_signature_only(
         slab_n=slab_n,
         binding_tau=binding_tau,
         signature_mode=str(signature_mode),
+        surface_reference=surface_reference,
     )
     basins: list[dict] = []
     basin_id = 0
@@ -820,6 +984,7 @@ def cluster_by_signature_and_rmsd(
     fuzzy_membership_cutoff: float = 0.5,
     signature_mode: str = "absolute",
     use_signature_grouping: bool = True,
+    surface_reference: Atoms | None = None,
 ) -> list[dict]:
     by_sig = _group_items_by_signature(
         frames=frames,
@@ -827,6 +992,7 @@ def cluster_by_signature_and_rmsd(
         slab_n=slab_n,
         binding_tau=binding_tau,
         signature_mode=str(signature_mode),
+        surface_reference=surface_reference,
     )
     if not bool(use_signature_grouping):
         flat = []

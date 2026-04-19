@@ -229,7 +229,7 @@ def main():
             atom_features, feature_backend = make_surface_atom_features(slab)
             emb = PrimitiveEmbedder(PrimitiveEmbeddingConfig(l2_distance_threshold=0.22))
             emb_res = emb.fit_transform(slab=slab, primitives=primitives, atom_features=atom_features)
-            site_dict = build_site_dictionary(emb_res.primitives)
+            site_dict = build_site_dictionary(emb_res.primitives, slab=slab)
             kinds = Counter(p.kind for p in primitives)
             graph_sites = {"1c": [], "2c": [], "3c": [], "4c": []}
             for p in primitives:

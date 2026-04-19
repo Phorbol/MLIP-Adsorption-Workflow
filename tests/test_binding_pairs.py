@@ -66,6 +66,40 @@ class TestBindingPairs(unittest.TestCase):
         self.assertEqual(reason, "desorption")
         self.assertEqual(metrics["binding_pair_n"], 0)
 
+    def test_anomaly_can_disable_surface_reconstruction_filter(self):
+        slab = Atoms(
+            "Pt2",
+            positions=[
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=[False, False, False],
+        )
+        adsorbate = Atoms(
+            "H",
+            positions=[[0.0, 0.0, 1.6]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=[False, False, False],
+        )
+        relaxed = slab.copy() + adsorbate.copy()
+        relaxed.positions[1] += [0.0, 0.0, 1.0]
+        reason, metrics = classify_anomaly(
+            relaxed=relaxed,
+            slab_ref=slab,
+            adsorbate_ref=adsorbate,
+            slab_n=2,
+            normal_axis=2,
+            binding_tau=1.15,
+            desorption_min_bonds=1,
+            surface_reconstruction_max_disp=0.5,
+            dissociation_allow_bond_change=False,
+            burial_margin=10.0,
+            surface_reconstruction_enabled=False,
+        )
+        self.assertIsNone(reason)
+        self.assertGreater(metrics["surface_max_disp"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

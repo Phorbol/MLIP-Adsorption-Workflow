@@ -40,6 +40,7 @@ def _default_configs(mace_model_path: str, mace_device: str, mace_dtype: str) ->
         "energy_window_ev": 2.5,
         "desorption_min_bonds": 1,
         "binding_tau": 1.15,
+        "mace_enable_cueq": True,
         "work_dir": None,
     }
     return {
@@ -113,6 +114,210 @@ def _default_configs(mace_model_path: str, mace_device: str, mace_dtype: str) ->
             mace_dtype=str(mace_dtype),
             **common,
         ),
+        "abs_mace_0p05": BasinConfig(
+            dedup_metric="mace_node_l2",
+            signature_mode="absolute",
+            dedup_cluster_method="hierarchical",
+            mace_node_l2_threshold=0.05,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "abs_mace_0p10": BasinConfig(
+            dedup_metric="mace_node_l2",
+            signature_mode="absolute",
+            dedup_cluster_method="hierarchical",
+            mace_node_l2_threshold=0.10,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "abs_mace_0p20": BasinConfig(
+            dedup_metric="mace_node_l2",
+            signature_mode="absolute",
+            dedup_cluster_method="hierarchical",
+            mace_node_l2_threshold=0.20,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_canonical_mace_0p05": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="mace_node_l2",
+            final_basin_merge_node_l2_threshold=0.05,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_canonical_mace_0p10": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="mace_node_l2",
+            final_basin_merge_node_l2_threshold=0.10,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_pure_mace_0p05": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.05,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="none",
+            final_basin_merge_use_signature_grouping=False,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p02": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.02,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p02_e0p05": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.02,
+            final_basin_merge_energy_gate_ev=0.05,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p02_e0p08": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.02,
+            final_basin_merge_energy_gate_ev=0.08,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p02_e0p10": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.02,
+            final_basin_merge_energy_gate_ev=0.10,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p03": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.03,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
+        "binding_surface_merge_ref_canonical_mace_0p05": BasinConfig(
+            dedup_metric="binding_surface_distance",
+            signature_mode="provenance",
+            dedup_cluster_method="hierarchical",
+            surface_descriptor_threshold=0.30,
+            surface_descriptor_nearest_k=8,
+            surface_descriptor_atom_mode="binding_only",
+            surface_descriptor_relative=False,
+            surface_descriptor_rmsd_gate=0.25,
+            final_basin_merge_metric="pure_mace",
+            final_basin_merge_node_l2_threshold=0.05,
+            final_basin_merge_cluster_method="hierarchical",
+            final_basin_merge_signature_mode="reference_canonical",
+            final_basin_merge_use_signature_grouping=True,
+            mace_model_path=str(mace_model_path),
+            mace_device=str(mace_device),
+            mace_dtype=str(mace_dtype),
+            **common,
+        ),
     }
 
 
@@ -148,9 +353,21 @@ def run(args: argparse.Namespace) -> Path:
         mace_device=str(args.mace_device),
         mace_dtype=str(args.mace_dtype),
     )
+    if args.configs:
+        allow = {x.strip() for x in str(args.configs).split(",") if x.strip()}
+        configs = {name: cfg for name, cfg in configs.items() if name in allow}
+        if not configs:
+            raise ValueError("No configs matched --configs filter.")
     rows = []
+    skipped_cases: list[dict[str, str]] = []
     for case_name in case_names:
         case_root = _case_root(benchmark_root, suite, case_name)
+        relaxed_path = case_root / "basin_work" / "relax" / "relaxed_stream.extxyz"
+        if not relaxed_path.exists():
+            if bool(args.skip_missing):
+                skipped_cases.append({"case": str(case_name), "missing_path": relaxed_path.as_posix()})
+                continue
+            raise FileNotFoundError(relaxed_path.as_posix())
         frames = _load_relaxed_frames(case_root)
         case = registry[case_name]
         result = run_named_basin_ablation(
@@ -176,6 +393,7 @@ def run(args: argparse.Namespace) -> Path:
         "suite": suite,
         "benchmark_root": benchmark_root.as_posix(),
         "config_names": list(configs.keys()),
+        "skipped_cases": skipped_cases,
         "rows": rows,
     }
     out_path = out_root / "final_dedup_ablation_matrix.json"
@@ -207,6 +425,8 @@ def main() -> int:
     parser.add_argument("--benchmark-root", type=str, required=True)
     parser.add_argument("--cases", type=str, default="")
     parser.add_argument("--out-root", type=str, required=True)
+    parser.add_argument("--configs", type=str, default="")
+    parser.add_argument("--skip-missing", action="store_true")
     parser.add_argument("--mace-model-path", type=str, default="/root/.cache/mace/mace-omat-0-small.model")
     parser.add_argument("--mace-device", type=str, default="cuda")
     parser.add_argument("--mace-dtype", type=str, default="float32")

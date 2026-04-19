@@ -5,8 +5,10 @@ from unittest.mock import patch
 
 import numpy as np
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 
 from adsorption_ensemble.relax.backends import (
+    IdentityRelaxBackend,
     MACEBatchRelaxBackend,
     MaceRelaxConfig,
     normalize_mace_descriptor_config,
@@ -85,6 +87,18 @@ class TestRelaxBackends(unittest.TestCase):
         self.assertTrue(np.isnan(float(energies[0])))
         self.assertIn("cueq=1", backend_name)
         self.assertTrue(bool(get_calc.call_args.kwargs["enable_cueq"]))
+
+    def test_identity_relax_backend_preserves_singlepoint_energy(self):
+        frame = Atoms("H", positions=[[0.0, 0.0, 0.0]])
+        frame.calc = SinglePointCalculator(frame, energy=-1.23)
+        out_frames, energies, backend_name = IdentityRelaxBackend().relax(
+            frames=[frame],
+            maxf=0.1,
+            steps=1,
+        )
+        self.assertEqual(len(out_frames), 1)
+        self.assertEqual(backend_name, "identity")
+        self.assertAlmostEqual(float(energies[0]), -1.23)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from ase import Atoms
 from ase.io import read, write
 
 from adsorption_ensemble.basin import BasinBuilder, BasinConfig
-from adsorption_ensemble.benchmark import audit_cu111_co_case, build_ase_reference_frames
+from adsorption_ensemble.benchmark import audit_cu111_co_case, build_ase_reference_frames, select_unique_reference_matches
 from adsorption_ensemble.basin.dedup import symmetry_aware_kabsch_rmsd
 from adsorption_ensemble.pose import PoseSampler
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
@@ -86,12 +86,10 @@ def _load_basins(extxyz_path: str | None) -> list[Atoms]:
 
 
 def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, rmsd_threshold: float = 0.20) -> dict[str, Any]:
-    matched = 0
-    matches = []
+    candidates = []
     for j, b in enumerate(manual_basins):
         b_pos = np.asarray(b.get_positions(), dtype=float)[slab_n:]
         b_ads = b[slab_n:]
-        best = None
         for i, a in enumerate(ours_basins):
             sig_a = str(a.info.get("signature", ""))
             sig_b = str(b.info.get("signature", ""))
@@ -99,19 +97,23 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
             d = float(symmetry_aware_kabsch_rmsd(a_pos, b_pos, b_ads))
             if not np.isfinite(d):
                 continue
-            candidate = {
-                "manual_index": int(j),
-                "ours_index": int(i),
-                "signature": sig_a,
-                "signature_match": bool(sig_a == sig_b and sig_a.strip()),
-                "rmsd": float(d),
-            }
-            rank = (0 if candidate["signature_match"] else 1, float(d), int(i))
-            if best is None or rank < best[0]:
-                best = (rank, candidate)
-        if best is not None and float(best[1]["rmsd"]) <= float(rmsd_threshold):
-            matched += 1
-            matches.append(best[1])
+            if float(d) > float(rmsd_threshold):
+                continue
+            candidates.append(
+                {
+                    "manual_index": int(j),
+                    "ours_index": int(i),
+                    "signature": sig_a,
+                    "signature_match": bool(sig_a == sig_b and sig_a.strip()),
+                    "rmsd": float(d),
+                }
+            )
+    matches = select_unique_reference_matches(
+        candidates,
+        n_manual=int(len(manual_basins)),
+        n_ours=int(len(ours_basins)),
+    )
+    matched = int(len(matches))
     n_manual = int(len(manual_basins))
     n_ours = int(len(ours_basins))
     recall: float | None
@@ -129,6 +131,7 @@ def _overlap(manual_basins: list[Atoms], ours_basins: list[Atoms], slab_n: int, 
         "matched_manual_basins": int(matched),
         "n_manual_basins": int(n_manual),
         "n_ours_basins": int(n_ours),
+        "n_unique_ours_matches": int(len({int(row["ours_index"]) for row in matches})),
         "manual_recall_by_ours": recall,
         "manual_reference_state": str(reference_state),
         "matches": matches,

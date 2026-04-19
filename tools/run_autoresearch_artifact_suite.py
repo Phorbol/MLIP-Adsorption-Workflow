@@ -16,8 +16,12 @@ from adsorption_ensemble.basin import BasinConfig
 from adsorption_ensemble.pose import PoseSamplerConfig
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.site import PrimitiveEmbeddingConfig
-from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
-from adsorption_ensemble.workflows import AdsorptionWorkflowConfig, evaluate_adsorption_workflow_readiness, run_adsorption_workflow
+from adsorption_ensemble.workflows import (
+    AdsorptionWorkflowConfig,
+    evaluate_adsorption_workflow_readiness,
+    make_default_surface_preprocessor,
+    run_adsorption_workflow,
+)
 from tests.chemistry_cases import get_test_adsorbate_cases
 
 
@@ -92,13 +96,7 @@ def build_config(
 ) -> AdsorptionWorkflowConfig:
     return AdsorptionWorkflowConfig(
         work_dir=work_dir,
-        surface_preprocessor=SurfacePreprocessor(
-            min_surface_atoms=6,
-            primary_detector=ProbeScanDetector(grid_step=0.6),
-            fallback_detector=VoxelFloodDetector(spacing=0.8),
-            target_surface_fraction=None,
-            target_count_mode="off",
-        ),
+        surface_preprocessor=make_default_surface_preprocessor(),
         pose_sampler_config=PoseSamplerConfig(
             n_rotations=4,
             n_azimuth=8,

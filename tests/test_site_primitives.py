@@ -5,7 +5,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
-from ase.build import bcc100, bcc110, bcc111, fcc100, fcc110, fcc111, fcc211
+from ase.build import bcc100, bcc110, bcc111, fcc100, fcc110, fcc111, fcc211, hcp10m10
+from ase.build import surface
+from ase.spacegroup import crystal
 
 from adsorption_ensemble.site import (
     PrimitiveBuilder,
@@ -18,6 +20,19 @@ from adsorption_ensemble.site import (
 from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
 from adsorption_ensemble.visualization import plot_inequivalent_sites_2d, plot_site_centers_only, plot_surface_primitives_2d
 from adsorption_ensemble.site.primitives import SitePrimitive
+
+
+def _replace_top_layer_atoms(slab, from_symbol: str, to_symbol: str, frac: float):
+    out = slab.copy()
+    z = np.asarray(out.get_positions(), dtype=float)[:, 2]
+    z_top = float(np.max(z))
+    top = [i for i, zi in enumerate(z) if (z_top - zi) < 1.0]
+    n_swap = max(1, int(round(len(top) * float(frac))))
+    for i in top[:n_swap]:
+        if out[i].symbol == from_symbol:
+            out[i].symbol = to_symbol
+    out.info.pop("adsorbate_info", None)
+    return out
 
 
 class TestSitePrimitives(unittest.TestCase):
@@ -39,6 +54,14 @@ class TestSitePrimitives(unittest.TestCase):
         self.assertGreater(len(primitives), 0)
         self.assertTrue(all(p.topo_hash for p in primitives))
 
+    def test_builder_ignores_ase_reference_sites_even_when_requested(self):
+        slab = fcc111("Pt", size=(4, 4, 4), vacuum=12.0)
+        self.assertIn("adsorbate_info", slab.info)
+        ctx = self.pre.build_context(slab)
+        primitives = PrimitiveBuilder(use_ase_reference_sites=True).build(slab, ctx)
+        self.assertGreater(len(primitives), 4)
+        self.assertTrue(all(p.site_label is None for p in primitives))
+
     def test_pt100_sanity_has_4c(self):
         slab = fcc100("Pt", size=(4, 4, 4), vacuum=12.0)
         _, primitives, kinds = self._build_counts(slab)
@@ -53,6 +76,37 @@ class TestSitePrimitives(unittest.TestCase):
         self.assertGreater(kinds["1c"], 0)
         self.assertGreater(kinds["2c"], 0)
         self.assertGreater(len(primitives), 0)
+
+    def test_fcc111_has_no_spurious_fourfold_sites(self):
+        slab = fcc111("Pt", size=(4, 4, 4), vacuum=12.0)
+        _, _, kinds = self._build_counts(slab)
+        self.assertEqual(kinds["4c"], 0)
+
+    def test_step_surfaces_do_not_emit_cross_level_fourfold_sites(self):
+        cases = {
+            "Pt_fcc211": fcc211("Pt", size=(6, 4, 4), vacuum=12.0),
+            "Ru_hcp10m10": hcp10m10("Ru", size=(4, 4, 4), vacuum=12.0),
+        }
+        for name, slab in cases.items():
+            with self.subTest(case=name):
+                _, primitives, kinds = self._build_counts(slab)
+                self.assertEqual(kinds["4c"], 0)
+                self.assertGreaterEqual(kinds["2c"], 1)
+
+    def test_tio2_contains_ti_in_surface_and_primitives(self):
+        rutile = crystal(
+            symbols=["Ti", "O"],
+            basis=[(0.0, 0.0, 0.0), (0.305, 0.305, 0.0)],
+            spacegroup=136,
+            cellpar=[4.594, 4.594, 2.959, 90, 90, 90],
+        )
+        slab = surface(rutile, (1, 1, 0), layers=6, vacuum=12.0).repeat((2, 2, 1))
+        ctx, primitives, _ = self._build_counts(slab)
+        surface_symbols = {slab[int(i)].symbol for i in ctx.detection.surface_atom_ids}
+        self.assertEqual(surface_symbols, {"O", "Ti"})
+        primitive_formulas = {"".join(sorted(slab[int(i)].symbol for i in p.atom_ids)) for p in primitives}
+        self.assertTrue(any("Ti" in formula for formula in primitive_formulas))
+        self.assertTrue(any("O" in formula and "Ti" in formula for formula in primitive_formulas))
 
     def test_local_frame_orthonormality(self):
         slab = fcc111("Pt", size=(3, 3, 4), vacuum=10.0)
@@ -179,7 +233,7 @@ class TestSitePrimitives(unittest.TestCase):
             self.assertIsNotNone(b.basis_id)
         site_dict = build_site_dictionary(out.primitives)
         self.assertEqual(site_dict["meta"]["n_basis_groups"], out.basis_count)
-        expected_dim = atom_features.shape[1]
+        expected_dim = atom_features.shape[1] + 4 + embedder.config.geom_k_nearest
         for p in out.primitives:
             self.assertEqual(len(p.embedding), expected_dim)
 
@@ -187,17 +241,25 @@ class TestSitePrimitives(unittest.TestCase):
         slab = fcc111("Pt", size=(4, 4, 4), vacuum=12.0)
         _, primitives, _ = self._build_counts(slab)
         atom_features = np.ones((len(slab), 1), dtype=float)
-        embedder = PrimitiveEmbedder(PrimitiveEmbeddingConfig(l2_distance_threshold=1e-12))
+        embedder = PrimitiveEmbedder(PrimitiveEmbeddingConfig(l2_distance_threshold=1e-12, include_geom_aux=False))
         out = embedder.fit_transform(slab=slab, primitives=primitives, atom_features=atom_features)
-        unique_topo = len({p.topo_hash for p in out.primitives})
-        self.assertEqual(out.basis_count, unique_topo)
-        self.assertLess(out.basis_count, out.raw_count)
+        unique_bucket_keys = len({embedder._bucket_key(p, slab) for p in out.primitives})
+        self.assertEqual(out.basis_count, unique_bucket_keys)
+        self.assertEqual(out.basis_count, 3)
+        self.assertGreater(out.raw_count, out.basis_count)
+        self.assertEqual(Counter(p.kind for p in out.basis_primitives), Counter({"1c": 1, "2c": 1, "3c": 1}))
 
     def test_classic_slab_gate_fixed_config_with_mace_features(self):
         try:
             from mace.calculators import MACECalculator
         except Exception as exc:
             self.skipTest(f"mace unavailable: {exc}")
+        try:
+            import torch
+        except Exception as exc:
+            self.skipTest(f"torch unavailable: {exc}")
+        if not bool(torch.cuda.is_available()):
+            self.skipTest("CUDA is required for the MACE primitive regression test.")
         model_path = None
         env_model = str(os.environ.get("AE_MACE_MODEL_PATH", "")).strip()
         if env_model and Path(env_model).exists():
@@ -205,8 +267,6 @@ class TestSitePrimitives(unittest.TestCase):
         else:
             for cand in (
                 "/root/.cache/mace/mace-omat-0-small.model",
-                "/root/.cache/mace/mace-mh-1.model",
-                "/root/.cache/mace/MACE-OFF23_small.model",
             ):
                 if Path(cand).exists():
                     model_path = cand
@@ -214,7 +274,7 @@ class TestSitePrimitives(unittest.TestCase):
         if model_path is None:
             self.skipTest("No local MACE model available for offline test.")
         try:
-            calc = MACECalculator(model_paths=[model_path], device="cpu", default_dtype="float64")
+            calc = MACECalculator(model_paths=[model_path], device="cuda", default_dtype="float32", enable_cueq=True)
         except ValueError as exc:
             msg = str(exc)
             if "Available heads are:" not in msg:
@@ -225,7 +285,13 @@ class TestSitePrimitives(unittest.TestCase):
             if not heads:
                 raise
             head = "omat_pbe" if "omat_pbe" in heads else heads[0]
-            calc = MACECalculator(model_paths=[model_path], device="cpu", default_dtype="float64", head=head)
+            calc = MACECalculator(
+                model_paths=[model_path],
+                device="cuda",
+                default_dtype="float32",
+                enable_cueq=True,
+                head=head,
+            )
         pre = SurfacePreprocessor(
             min_surface_atoms=6,
             primary_detector=ProbeScanDetector(grid_step=0.6),
@@ -240,10 +306,10 @@ class TestSitePrimitives(unittest.TestCase):
             "fcc211": fcc211("Pt", size=(6, 4, 4), vacuum=12.0),
         }
         expected = {
-            "fcc111": {"surface_n": 16, "raw": 96, "basis": 4},
-            "fcc100": {"surface_n": 16, "raw": 64, "basis": 3},
-            "fcc110": {"surface_n": 32, "raw": 192, "basis": 7},
-            "fcc211": {"surface_n": 24, "raw": 128, "basis": 14},
+            "fcc111": {"surface_n": 16, "raw": 96, "basis": Counter({"1c": 1, "2c": 1, "3c": 2})},
+            "fcc100": {"surface_n": 16, "raw": 64, "basis": Counter({"1c": 1, "2c": 1, "4c": 1})},
+            "fcc110": {"surface_n": 16, "raw": 64, "basis": Counter({"1c": 1, "2c": 2, "4c": 1})},
+            "fcc211": {"surface_n": 24, "raw": 120, "basis": Counter({"1c": 2, "2c": 4, "3c": 4})},
         }
         for name, slab in slabs.items():
             with self.subTest(case=name):
@@ -255,12 +321,47 @@ class TestSitePrimitives(unittest.TestCase):
                 )
                 self.assertEqual(len(ctx.detection.surface_atom_ids), expected[name]["surface_n"])
                 self.assertEqual(out.raw_count, expected[name]["raw"])
-                self.assertEqual(out.basis_count, expected[name]["basis"])
+                self.assertEqual(Counter(p.kind for p in out.basis_primitives), expected[name]["basis"])
+                self.assertEqual(out.basis_count, int(sum(expected[name]["basis"].values())))
+
+    def test_alloy_fcc111_species_aware_embedding_keeps_distinct_site_families(self):
+        slab = _replace_top_layer_atoms(fcc111("Cu", size=(4, 4, 4), vacuum=12.0), "Cu", "Ni", frac=0.25)
+        ctx = SurfacePreprocessor(min_surface_atoms=6).build_context(slab)
+        primitives = PrimitiveBuilder().build(slab, ctx)
+        atom_features = (slab.get_atomic_numbers().astype(float) / (np.max(slab.get_atomic_numbers()) + 1.0e-12)).reshape(-1, 1)
+        out = PrimitiveEmbedder(PrimitiveEmbeddingConfig(l2_distance_threshold=0.20)).fit_transform(
+            slab=slab,
+            primitives=primitives,
+            atom_features=atom_features,
+        )
+
+        self.assertEqual(out.basis_count, 11)
+        self.assertEqual(Counter(p.kind for p in out.basis_primitives), Counter({"1c": 2, "2c": 3, "3c": 6}))
+
+        def _formula(atom_ids):
+            symbols = Counter(str(slab[int(i)].symbol) for i in atom_ids)
+            return "".join(sym if n == 1 else f"{sym}{n}" for sym, n in sorted(symbols.items()))
+
+        self.assertEqual(
+            Counter(_formula(p.atom_ids) for p in out.basis_primitives),
+            Counter(
+                {
+                    "Ni": 1,
+                    "Cu": 1,
+                    "Ni2": 1,
+                    "CuNi": 1,
+                    "Cu2": 1,
+                    "CuNi2": 2,
+                    "Cu2Ni": 2,
+                    "Cu3": 2,
+                }
+            ),
+        )
 
     def test_build_site_dictionary_contains_atom_and_normal(self):
         slab = fcc111("Pt", size=(4, 4, 4), vacuum=12.0)
         _, primitives, _ = self._build_counts(slab)
-        site_dict = build_site_dictionary(primitives)
+        site_dict = build_site_dictionary(primitives, slab=slab)
         self.assertIn("sites", site_dict)
         self.assertIn("kinds", site_dict)
         self.assertIn("basis_groups", site_dict)
@@ -274,6 +375,12 @@ class TestSitePrimitives(unittest.TestCase):
             self.assertEqual(len(rec["normal"]), 3)
             self.assertEqual(len(rec["t1"]), 3)
             self.assertEqual(len(rec["t2"]), 3)
+            self.assertEqual(rec["coordinates"], rec["center"])
+            self.assertEqual(rec["n_vector"], rec["normal"])
+            self.assertEqual(rec["h_vector"], rec["t1"])
+            self.assertEqual(int(rec["connectivity"]), len(rec["atom_ids"]))
+            self.assertIsInstance(rec["topology"], str)
+            self.assertIsInstance(rec["site_formula"], str)
         all_kind_site_ids = set()
         for ids in site_dict["kinds"].values():
             all_kind_site_ids.update(ids)

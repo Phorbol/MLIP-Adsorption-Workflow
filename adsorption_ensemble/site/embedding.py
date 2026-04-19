@@ -39,7 +39,7 @@ class PrimitiveEmbedder:
         self._validate_inputs(slab, primitives, atom_features)
         for p in primitives:
             p.embedding = self._build_primitive_embedding(p, atom_features=atom_features, slab=slab, config=self.config)
-        buckets = self._bucket_by_topology(primitives)
+        buckets = self._bucket_by_topology(primitives=primitives, slab=slab)
         assigned = self._cluster_within_buckets(primitives, buckets)
         basis_ids = sorted({int(x) for x in assigned if x is not None})
         basis_primitives = [primitives[i] for i in basis_ids]
@@ -121,13 +121,35 @@ class PrimitiveEmbedder:
         return out / scale
 
     @staticmethod
-    def _bucket_by_topology(primitives: list[SitePrimitive]) -> dict[str, list[int]]:
+    def _bucket_by_topology(primitives: list[SitePrimitive], slab: Atoms) -> dict[str, list[int]]:
         buckets: dict[str, list[int]] = {}
         for i, p in enumerate(primitives):
-            buckets.setdefault(p.topo_hash, []).append(i)
+            key = PrimitiveEmbedder._bucket_key(primitive=p, slab=slab)
+            buckets.setdefault(key, []).append(i)
         for k in buckets:
             buckets[k] = sorted(buckets[k], key=lambda x: (primitives[x].kind, primitives[x].atom_ids))
         return buckets
+
+    @staticmethod
+    def _bucket_key(primitive: SitePrimitive, slab: Atoms) -> str:
+        # Do not compare alloy/oxide sites with different site-atom chemistry in the same bucket.
+        # This prevents Cu/Ni atop or Cu2/CuNi/Ni2 bridge families from collapsing purely because
+        # the atomic-number feature scale is small relative to the L2 threshold.
+        species_sig = PrimitiveEmbedder._site_species_signature(slab=slab, atom_ids=primitive.atom_ids)
+        label_sig = "" if primitive.site_label is None else str(primitive.site_label).strip().lower()
+        return f"{primitive.topo_hash}|species={species_sig}|label={label_sig}"
+
+    @staticmethod
+    def _site_species_signature(slab: Atoms, atom_ids: tuple[int, ...]) -> str:
+        nums = []
+        for idx in atom_ids:
+            i = int(idx)
+            if 0 <= i < len(slab):
+                nums.append(int(slab.numbers[i]))
+        if not nums:
+            return "none"
+        nums.sort()
+        return ",".join(str(v) for v in nums)
 
     def _cluster_within_buckets(
         self,

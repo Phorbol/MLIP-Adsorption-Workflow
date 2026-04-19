@@ -1,0 +1,12 @@
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+.trae/
+.codex
+
+artifacts/
+runs/
+
+*.log
+

@@ -29,6 +29,78 @@ _PAULING_ELECTRONEGATIVITY = {
     53: 2.66,
 }
 
+_POSE_ORTHO_MIN_RATIO_NUMBA_SENTINEL = object()
+_POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL = _POSE_ORTHO_MIN_RATIO_NUMBA_SENTINEL
+
+
+def _get_pose_orthogonal_min_ratio_kernel():
+    global _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL
+    if _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL is None:
+        return None
+    if _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL is not _POSE_ORTHO_MIN_RATIO_NUMBA_SENTINEL:
+        return _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL
+    try:
+        import numba
+    except Exception:
+        _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL = None
+        return None
+
+    @numba.njit(cache=True, fastmath=True)
+    def min_ratio2_orthogonal(
+        placed_pos: np.ndarray,
+        surf_frac: np.ndarray,
+        inv_cell: np.ndarray,
+        lengths: np.ndarray,
+        pbc_mask: np.ndarray,
+        denom2: np.ndarray,
+        site_ids_local: np.ndarray,
+    ) -> tuple[float, float]:
+        na = placed_pos.shape[0]
+        ns = surf_frac.shape[0]
+        min_surface2 = np.inf
+        min_site2 = np.inf
+        has_site = site_ids_local.shape[0] > 0
+        for ai in range(na):
+            fx = (
+                placed_pos[ai, 0] * inv_cell[0, 0]
+                + placed_pos[ai, 1] * inv_cell[1, 0]
+                + placed_pos[ai, 2] * inv_cell[2, 0]
+            )
+            fy = (
+                placed_pos[ai, 0] * inv_cell[0, 1]
+                + placed_pos[ai, 1] * inv_cell[1, 1]
+                + placed_pos[ai, 2] * inv_cell[2, 1]
+            )
+            fz = (
+                placed_pos[ai, 0] * inv_cell[0, 2]
+                + placed_pos[ai, 1] * inv_cell[1, 2]
+                + placed_pos[ai, 2] * inv_cell[2, 2]
+            )
+            for sj in range(ns):
+                dx = surf_frac[sj, 0] - fx
+                dy = surf_frac[sj, 1] - fy
+                dz = surf_frac[sj, 2] - fz
+                if pbc_mask[0]:
+                    dx = dx - np.round(dx)
+                if pbc_mask[1]:
+                    dy = dy - np.round(dy)
+                if pbc_mask[2]:
+                    dz = dz - np.round(dz)
+                d2 = dx * dx * lengths[0] * lengths[0] + dy * dy * lengths[1] * lengths[1] + dz * dz * lengths[2] * lengths[2]
+                ratio2 = d2 / denom2[ai, sj]
+                if ratio2 < min_surface2:
+                    min_surface2 = ratio2
+                if has_site:
+                    for kk in range(site_ids_local.shape[0]):
+                        if sj == site_ids_local[kk]:
+                            if ratio2 < min_site2:
+                                min_site2 = ratio2
+                            break
+        return min_site2, min_surface2
+
+    _POSE_ORTHO_MIN_RATIO_NUMBA_KERNEL = min_ratio2_orthogonal
+    return min_ratio2_orthogonal
+
 
 @dataclass
 class PoseSamplerConfig:
@@ -59,6 +131,10 @@ class PoseSamplerConfig:
     neighborlist_cutoff_padding: float = 0.30
     nonlinear_atom_down_coverage: bool = True
     nonlinear_atom_down_max_vectors: int = 4
+    adaptive_height_fallback: bool = True
+    adaptive_height_fallback_step: float = 0.20
+    adaptive_height_fallback_max_extra: float = 1.60
+    adaptive_height_fallback_contact_slack: float = 0.60
 
 
 @dataclass
@@ -101,6 +177,7 @@ class PoseSampler:
         self._mic_inv_rcell: np.ndarray | None = None
         self._mic_vrvecs: np.ndarray | None = None
         self._nl_tau_factor: float = self._resolve_neighborlist_tau_factor()
+        self._ortho_min_ratio_kernel = _get_pose_orthogonal_min_ratio_kernel()
 
     def sample(
         self,
@@ -187,6 +264,8 @@ class PoseSampler:
                     rotated = self._rotated_adsorbate(ads_base, quat)
                     for aidx, az in enumerate(azimuth_list):
                         rotated_az = self._rotate_around_axis(rotated, primitive.normal, az)
+                        q_az = self._rotation_quaternion(primitive.normal, az)
+                        q_tot = self._quaternion_multiply(q_az, quat)
                         t0 = perf_counter() if prof is not None else 0.0
                         if prof is not None:
                             prof["n_solve_height"] += 1
@@ -201,6 +280,24 @@ class PoseSampler:
                         if prof is not None:
                             prof["t_solve_height_s"] += float(perf_counter() - t0)
                         if h is None:
+                            if bool(self.config.adaptive_height_fallback):
+                                candidate = self._build_adaptive_height_candidate(
+                                    primitive_index=int(pidx),
+                                    basis_id=primitive.basis_id,
+                                    rotation_index=int(ridx),
+                                    azimuth_index=int(aidx),
+                                    azimuth_rad=float(az),
+                                    shift_uv=np.asarray(shift_uv, dtype=float),
+                                    quaternion=np.asarray(q_tot, dtype=float),
+                                    center=np.asarray(center, dtype=float),
+                                    normal=np.asarray(primitive.normal, dtype=float),
+                                    rotated_az=rotated_az,
+                                    site_ids_local=list(site_ids_local),
+                                    mol_class=str(mol_class),
+                                    base_height=None,
+                                )
+                                if candidate is not None:
+                                    site_candidates.append(candidate)
                             if prof is not None:
                                 prof["n_height_none"] += 1
                             continue
@@ -208,39 +305,25 @@ class PoseSampler:
                             h_use = float(h + hdelta)
                             if h_use < self.config.min_height - 1e-12 or h_use > self.config.max_height + 1e-12:
                                 continue
-                            translation = center + h_use * primitive.normal
-                            placed_pos = np.asarray(rotated_az.positions, dtype=float) + translation
-                            t1 = perf_counter() if prof is not None else 0.0
-                            if prof is not None:
-                                prof["n_has_clash"] += 1
-                            clash = self._check_clash_positions(placed_pos, float(self.config.clash_tau))
-                            if prof is not None:
-                                prof["t_has_clash_s"] += float(perf_counter() - t1)
-                            if clash:
-                                continue
-                            placed = rotated_az.copy()
-                            placed.positions = placed_pos
-                            q_az = self._rotation_quaternion(primitive.normal, az)
-                            q_tot = self._quaternion_multiply(q_az, quat)
-                            site_candidates.append(
-                                PoseCandidate(
-                                    primitive_index=pidx,
-                                    basis_id=primitive.basis_id,
-                                    rotation_index=int(ridx),
-                                    azimuth_index=int(aidx),
-                                    azimuth_rad=float(az),
-                                    height_shift_index=int(hidx),
-                                    height_shift_delta=float(hdelta),
-                                    tilt_deg=self._estimate_tilt_deg(rotated_az, primitive.normal),
-                                    shift_uv=np.asarray(shift_uv, dtype=float),
-                                    quaternion=np.asarray(q_tot, dtype=float),
-                                    height=float(h_use),
-                                    com=np.asarray(placed.get_center_of_mass(), dtype=float),
-                                    atoms=placed,
-                                )
+                            candidate = self._build_pose_candidate(
+                                primitive_index=int(pidx),
+                                basis_id=primitive.basis_id,
+                                rotation_index=int(ridx),
+                                azimuth_index=int(aidx),
+                                azimuth_rad=float(az),
+                                height_shift_index=int(hidx),
+                                height_shift_delta=float(hdelta),
+                                shift_uv=np.asarray(shift_uv, dtype=float),
+                                quaternion=np.asarray(q_tot, dtype=float),
+                                height=float(h_use),
+                                center=np.asarray(center, dtype=float),
+                                normal=np.asarray(primitive.normal, dtype=float),
+                                rotated_adsorbate=rotated_az,
+                                site_ids_local=list(site_ids_local),
+                                mol_class=str(mol_class),
                             )
-                            if prof is not None:
-                                prof["n_candidates_raw"] += 1
+                            if candidate is not None:
+                                site_candidates.append(candidate)
             site_candidates.sort(key=lambda x: x.height)
             if self.config.max_poses_per_site is not None:
                 site_candidates = self._select_site_candidates(site_candidates, int(self.config.max_poses_per_site))
@@ -275,6 +358,161 @@ class PoseSampler:
         self._mic_inv_rcell = None
         self._mic_vrvecs = None
         return kept
+
+    def _build_pose_candidate(
+        self,
+        *,
+        primitive_index: int,
+        basis_id: int | None,
+        rotation_index: int,
+        azimuth_index: int,
+        azimuth_rad: float,
+        height_shift_index: int,
+        height_shift_delta: float,
+        shift_uv: np.ndarray,
+        quaternion: np.ndarray,
+        height: float,
+        center: np.ndarray,
+        normal: np.ndarray,
+        rotated_adsorbate: Atoms,
+        site_ids_local: list[int],
+        mol_class: str,
+    ) -> PoseCandidate | None:
+        translation = np.asarray(center, dtype=float) + float(height) * np.asarray(normal, dtype=float)
+        placed_pos = np.asarray(rotated_adsorbate.positions, dtype=float) + translation
+        prof = self._prof
+        t1 = perf_counter() if prof is not None else 0.0
+        if prof is not None:
+            prof["n_has_clash"] += 1
+        clash = self._check_clash_positions(placed_pos, float(self.config.clash_tau))
+        if prof is not None:
+            prof["t_has_clash_s"] += float(perf_counter() - t1)
+        if clash:
+            if bool(self.config.adaptive_height_fallback):
+                return self._build_adaptive_height_candidate(
+                    primitive_index=int(primitive_index),
+                    basis_id=basis_id,
+                    rotation_index=int(rotation_index),
+                    azimuth_index=int(azimuth_index),
+                    azimuth_rad=float(azimuth_rad),
+                    shift_uv=np.asarray(shift_uv, dtype=float),
+                    quaternion=np.asarray(quaternion, dtype=float),
+                    center=np.asarray(center, dtype=float),
+                    normal=np.asarray(normal, dtype=float),
+                    rotated_az=rotated_adsorbate,
+                    site_ids_local=list(site_ids_local),
+                    mol_class=str(mol_class),
+                    base_height=float(height),
+                )
+            return None
+        placed = rotated_adsorbate.copy()
+        placed.positions = placed_pos
+        candidate = PoseCandidate(
+            primitive_index=int(primitive_index),
+            basis_id=basis_id,
+            rotation_index=int(rotation_index),
+            azimuth_index=int(azimuth_index),
+            azimuth_rad=float(azimuth_rad),
+            height_shift_index=int(height_shift_index),
+            height_shift_delta=float(height_shift_delta),
+            tilt_deg=self._estimate_tilt_deg(rotated_adsorbate, np.asarray(normal, dtype=float)),
+            shift_uv=np.asarray(shift_uv, dtype=float),
+            quaternion=np.asarray(quaternion, dtype=float),
+            height=float(height),
+            com=np.asarray(placed.get_center_of_mass(), dtype=float),
+            atoms=placed,
+        )
+        if prof is not None:
+            prof["n_candidates_raw"] += 1
+        return candidate
+
+    def _build_adaptive_height_candidate(
+        self,
+        *,
+        primitive_index: int,
+        basis_id: int | None,
+        rotation_index: int,
+        azimuth_index: int,
+        azimuth_rad: float,
+        shift_uv: np.ndarray,
+        quaternion: np.ndarray,
+        center: np.ndarray,
+        normal: np.ndarray,
+        rotated_az: Atoms,
+        site_ids_local: list[int],
+        mol_class: str,
+        base_height: float | None,
+    ) -> PoseCandidate | None:
+        step = float(max(1e-4, self.config.adaptive_height_fallback_step, self.config.height_step))
+        start = self._adaptive_height_start(
+            base_height=base_height,
+            mol_class=str(mol_class),
+            site_coordination=len(site_ids_local),
+        )
+        stop = float(max(start, self.config.max_height) + max(0.0, float(self.config.adaptive_height_fallback_max_extra)))
+        enforce_contact_window = len(site_ids_local) < 3
+        extra_tol = 0.0
+        if mol_class == "diatomic":
+            extra_tol = float(self.config.diatomic_contact_extra_tolerance)
+        elif mol_class == "linear":
+            extra_tol = float(self.config.linear_contact_extra_tolerance)
+        target_tau = float(max(float(self.config.clash_tau), float(np.max(np.asarray(self.config.height_taus, dtype=float)))))
+        contact_limit = float(target_tau + self.config.site_contact_tolerance + extra_tol + self.config.adaptive_height_fallback_contact_slack)
+        probe = start
+        while probe <= stop + 1e-12:
+            translation = np.asarray(center, dtype=float) + float(probe) * np.asarray(normal, dtype=float)
+            placed_pos = np.asarray(rotated_az.positions, dtype=float) + translation
+            if not self._check_clash_positions(placed_pos, float(self.config.clash_tau)):
+                if not enforce_contact_window:
+                    return self._build_pose_candidate(
+                        primitive_index=int(primitive_index),
+                        basis_id=basis_id,
+                        rotation_index=int(rotation_index),
+                        azimuth_index=int(azimuth_index),
+                        azimuth_rad=float(azimuth_rad),
+                        height_shift_index=-1,
+                        height_shift_delta=float(0.0 if base_height is None else probe - float(base_height)),
+                        shift_uv=np.asarray(shift_uv, dtype=float),
+                        quaternion=np.asarray(quaternion, dtype=float),
+                        height=float(probe),
+                        center=np.asarray(center, dtype=float),
+                        normal=np.asarray(normal, dtype=float),
+                        rotated_adsorbate=rotated_az,
+                        site_ids_local=list(site_ids_local),
+                        mol_class=str(mol_class),
+                    )
+                min_site, min_surface = self._min_scaled_distance_site_and_surface(placed_pos, list(site_ids_local))
+                contact_metric = self._site_contact_metric(
+                    min_site=float(min_site),
+                    min_surface=float(min_surface),
+                    site_ids_local=list(site_ids_local),
+                )
+                if float(contact_metric) <= float(contact_limit):
+                    return self._build_pose_candidate(
+                        primitive_index=int(primitive_index),
+                        basis_id=basis_id,
+                        rotation_index=int(rotation_index),
+                        azimuth_index=int(azimuth_index),
+                        azimuth_rad=float(azimuth_rad),
+                        height_shift_index=-1,
+                        height_shift_delta=float(0.0 if base_height is None else probe - float(base_height)),
+                        shift_uv=np.asarray(shift_uv, dtype=float),
+                        quaternion=np.asarray(quaternion, dtype=float),
+                        height=float(probe),
+                        center=np.asarray(center, dtype=float),
+                        normal=np.asarray(normal, dtype=float),
+                        rotated_adsorbate=rotated_az,
+                        site_ids_local=list(site_ids_local),
+                        mol_class=str(mol_class),
+                    )
+            probe += step
+        return None
+
+    def _adaptive_height_start(self, *, base_height: float | None, mol_class: str, site_coordination: int) -> float:
+        preferred = float(max(self.config.min_height, self._preferred_min_height(mol_class=mol_class, site_coordination=site_coordination)))
+        if base_height is None:
+            return preferred
+        return float(max(preferred, float(base_height) + max(1e-4, float(self.config.adaptive_height_fallback_step))))
 
     def _center_adsorbate_for_sampling(self, adsorbate: Atoms) -> np.ndarray:
         ads = adsorbate.copy()
@@ -439,6 +677,23 @@ class PoseSampler:
         if na == 0 or ns == 0:
             return np.inf, np.inf
         if self._cell_orthogonal and inv_cell is not None and surf_frac is not None and lengths is not None and pbc is not None:
+            kernel = self._ortho_min_ratio_kernel
+            if kernel is not None:
+                site_arr = np.asarray(site_ids_local, dtype=np.int64)
+                min_site2, min_surface2 = kernel(
+                    np.asarray(placed_pos, dtype=float),
+                    np.asarray(surf_frac, dtype=float),
+                    np.asarray(inv_cell, dtype=float),
+                    np.asarray(lengths, dtype=float),
+                    np.asarray(pbc, dtype=np.bool_),
+                    np.asarray(denom2, dtype=float),
+                    site_arr,
+                )
+                min_surface = float(np.sqrt(max(0.0, float(min_surface2))))
+                if len(site_ids_local) == 0:
+                    return np.inf, min_surface
+                min_site = float(np.sqrt(max(0.0, float(min_site2))))
+                return min_site, min_surface
             ads_frac = np.asarray(placed_pos @ inv_cell, dtype=float)
             df = surf_frac[None, :, :] - ads_frac[:, None, :]
             for ax in range(3):
@@ -993,16 +1248,20 @@ class PoseSampler:
                 normal_u = np.asarray(normal, dtype=float)
                 normal_u = normal_u / (np.linalg.norm(normal_u) + 1e-12)
                 tangent = self._reference_tangent(normal_u)
+                entries: list[tuple[float, int, np.ndarray]] = []
                 for tilt_deg in self._linear_tilt_schedule(n_rot):
                     theta = np.deg2rad(float(tilt_deg))
                     target_base = np.cos(theta) * normal_u + np.sin(theta) * tangent
                     target_base = target_base / (np.linalg.norm(target_base) + 1e-12)
-                    for target in (target_base, -target_base):
+                    for sign_idx, target in enumerate((target_base, -target_base)):
                         q = self._quaternion_from_two_vectors(axis, target)
                         if q is not None:
-                            self._append_unique_quaternion(out, q)
-                            if len(out) >= n_rot:
-                                return out[:n_rot]
+                            qn = np.asarray(q, dtype=float)
+                            duplicate = any(self._quaternion_distance(qn, ref_q) <= 1e-6 for _, _, ref_q in entries)
+                            if not duplicate:
+                                entries.append((float(tilt_deg), int(sign_idx), qn))
+                if entries:
+                    return self._select_linear_quaternion_entries(entries, int(n_rot))
         elif mol_class == "nonlinear":
             normal_u = np.asarray(normal, dtype=float)
             normal_u = normal_u / (np.linalg.norm(normal_u) + 1e-12)
@@ -1217,12 +1476,47 @@ class PoseSampler:
 
     @staticmethod
     def _linear_tilt_schedule(n_rot: int) -> list[float]:
-        n = max(1, int(np.ceil(max(1, int(n_rot)) / 2.0)))
+        n = max(1, int(n_rot))
         base = [0.0, 25.0, 50.0, 80.0]
         if n <= len(base):
             return base[:n]
         extra = np.linspace(base[-1], 88.0, num=(n - len(base) + 1), endpoint=True)[1:]
         return base + [float(v) for v in extra.tolist()]
+
+    @staticmethod
+    def _select_linear_quaternion_entries(entries: list[tuple[float, int, np.ndarray]], n_rot: int) -> list[np.ndarray]:
+        if n_rot <= 0:
+            return []
+        if len(entries) <= n_rot:
+            return [np.asarray(q, dtype=float) for _, _, q in entries]
+        by_tilt: dict[float, dict[int, np.ndarray]] = {}
+        for tilt_deg, sign_idx, quat in entries:
+            by_tilt.setdefault(float(tilt_deg), {})[int(sign_idx)] = np.asarray(quat, dtype=float)
+        tilts = sorted(by_tilt)
+        ordered: list[np.ndarray] = []
+        for pass_idx in range(2):
+            for tilt_idx, tilt_deg in enumerate(tilts):
+                sign_pref = int((tilt_idx + pass_idx) % 2)
+                group = by_tilt[float(tilt_deg)]
+                for sign_idx in (sign_pref, 1 - sign_pref):
+                    quat = group.get(int(sign_idx))
+                    if quat is None:
+                        continue
+                    duplicate = any(PoseSampler._quaternion_distance(np.asarray(quat, dtype=float), ref) <= 1e-6 for ref in ordered)
+                    if duplicate:
+                        continue
+                    ordered.append(np.asarray(quat, dtype=float))
+                    break
+                if len(ordered) >= int(n_rot):
+                    return ordered[: int(n_rot)]
+        for _, _, quat in entries:
+            duplicate = any(PoseSampler._quaternion_distance(np.asarray(quat, dtype=float), ref) <= 1e-6 for ref in ordered)
+            if duplicate:
+                continue
+            ordered.append(np.asarray(quat, dtype=float))
+            if len(ordered) >= int(n_rot):
+                break
+        return ordered[: int(n_rot)]
 
     @staticmethod
     def _quaternion_from_two_vectors(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray | None:

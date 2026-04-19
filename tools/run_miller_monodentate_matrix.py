@@ -9,7 +9,12 @@ from typing import Any
 from ase import Atoms
 from ase.build import bcc100, bcc110, bcc111, fcc100, fcc110, fcc111, fcc211, hcp0001, hcp10m10, molecule
 
-from tools.run_ase_autoadsorbate_crosscheck import _placement_check_for_pair, _run_our_site_pipeline
+from tools.run_ase_autoadsorbate_crosscheck import (
+    _ase_reference_counts,
+    _placement_check_for_pair,
+    _run_our_site_pipeline,
+    _select_requested_names,
+)
 
 
 def build_miller_metal_slab_suite() -> dict[str, Atoms]:
@@ -49,19 +54,25 @@ def run(args: argparse.Namespace) -> Path:
     out_root.mkdir(parents=True, exist_ok=True)
     slabs = build_miller_metal_slab_suite()
     molecules = build_monodentate_suite()
-    slab_names = sorted(slabs.keys())
-    mol_names = sorted(molecules.keys())
-    if int(args.max_slabs) > 0:
-        slab_names = slab_names[: int(args.max_slabs)]
-    if int(args.max_molecules) > 0:
-        mol_names = mol_names[: int(args.max_molecules)]
+    slab_names = _select_requested_names(slabs, args.slab_names, int(args.max_slabs))
+    mol_names = _select_requested_names(molecules, args.molecule_names, int(args.max_molecules))
 
     slab_cache: dict[str, dict[str, Any]] = {}
     slab_rows: list[dict[str, Any]] = []
     for slab_name in slab_names:
         slab = slabs[slab_name]
         slab_dir = out_root / "slabs" / slab_name
-        ours = _run_our_site_pipeline(slab, slab_dir)
+        ours = _run_our_site_pipeline(slab, slab_dir, save_visuals=bool(args.save_visuals))
+        ase_ref = _ase_reference_counts(slab)
+        if ase_ref.get("status") == "ok":
+            exp = ase_ref["expected_mapped_counts"]
+            obs = {
+                "ontop": int(ours["basis_counts"].get("1c", 0)),
+                "bridge": int(ours["basis_counts"].get("2c", 0)),
+                "hollow": int(ours["basis_counts"].get("3c", 0) + ours["basis_counts"].get("4c", 0)),
+            }
+            ase_ref["observed_mapped_counts"] = obs
+            ase_ref["strict_mapped_counts_match"] = bool(obs == exp)
         slab_cache[slab_name] = ours
         slab_rows.append(
             {
@@ -70,6 +81,7 @@ def run(args: argparse.Namespace) -> Path:
                 "n_surface_atoms": int(ours["n_surface_atoms"]),
                 "n_basis_primitives": int(ours["n_basis_primitives"]),
                 "basis_counts": dict(ours["basis_counts"]),
+                "ase_reference": ase_ref,
             }
         )
 
@@ -117,9 +129,14 @@ def run(args: argparse.Namespace) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-root", type=str, default="artifacts/autoresearch/physics_audit/miller_monodentate_matrix")
+    parser.add_argument("--slab-names", nargs="*", default=None)
+    parser.add_argument("--molecule-names", nargs="*", default=None)
     parser.add_argument("--max-slabs", type=int, default=0)
     parser.add_argument("--max-molecules", type=int, default=0)
     parser.add_argument("--min-accepted-distance", type=float, default=0.70)
+    parser.add_argument("--save-visuals", dest="save_visuals", action="store_true")
+    parser.add_argument("--no-save-visuals", dest="save_visuals", action="store_false")
+    parser.set_defaults(save_visuals=True)
     args = parser.parse_args()
     out_path = run(args)
     print(out_path.as_posix())

@@ -4,7 +4,8 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 from ase import Atom
-from ase.build import bulk, fcc100, fcc110, fcc111, fcc211, molecule, surface
+from ase.build import bcc111, bulk, fcc100, fcc110, fcc111, fcc211, hcp10m10, molecule, surface
+from ase.spacegroup import crystal
 
 from adsorption_ensemble.selection import DualThresholdSelector, EnergyWindowFilter, FarthestPointSamplingSelector, RMSDSelector
 from adsorption_ensemble.surface import ExposedSurfaceGraphBuilder, ProbeScanDetector, SlabClassifier, SurfacePreprocessor, VoxelFloodDetector, export_surface_detection_report
@@ -66,6 +67,14 @@ class TestSurfacePipeline(unittest.TestCase):
         z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
         self.assertGreaterEqual(len(np.unique(z)), 3)
 
+    def test_ru_hcp10m10_keeps_step_levels(self):
+        slab = hcp10m10("Ru", size=(4, 4, 4), vacuum=12.0)
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="off").build_context(slab)
+        self.assertGreaterEqual(len(ctx.detection.surface_atom_ids), 16)
+        z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
+        self.assertGreaterEqual(len(np.unique(z)), 2)
+        self.assertEqual(ctx.detection.diagnostics.get("coordination_rescue"), "applied")
+
     def test_four_layer_cases_have_quarter_surface_atoms(self):
         slabs = [
             fcc111("Pt", size=(4, 4, 4), vacuum=12.0),
@@ -107,7 +116,8 @@ class TestSurfacePipeline(unittest.TestCase):
         ctx_v = pre.build_context(vac)
         ctx_a = pre.build_context(ada)
         self.assertEqual(len(ctx_v.detection.surface_atom_ids), 23)
-        self.assertEqual(len(ctx_a.detection.surface_atom_ids), 25)
+        self.assertEqual(len(ctx_a.detection.surface_atom_ids), 24)
+        self.assertTrue(bool(ctx_a.detection.diagnostics.get("target_count_upsample_skipped")))
 
     def test_auto_layers_target_on_non_four_layer(self):
         slab = fcc111("Pt", size=(4, 4, 6), vacuum=12.0)
@@ -133,6 +143,80 @@ class TestSurfacePipeline(unittest.TestCase):
                 ctx = pre.build_context(slab)
                 self.assertGreater(len(ctx.detection.surface_atom_ids), 0)
                 self.assertGreater(len(ctx.graph.edges), 0)
+
+    def test_adaptive_mode_collapses_weak_tail_on_bcc111(self):
+        slab = bcc111("Fe", size=(4, 4, 4), vacuum=12.0)
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="adaptive").build_context(slab)
+        self.assertEqual(len(ctx.detection.surface_atom_ids), 16)
+        z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
+        self.assertEqual(len(np.unique(z)), 1)
+        self.assertEqual(ctx.detection.diagnostics.get("adaptive_target_decision"), "apply_weak_second_level")
+        self.assertEqual(ctx.detection.diagnostics.get("target_mode"), "adaptive")
+
+    def test_adaptive_mode_keeps_step_levels_on_fcc211(self):
+        slab = fcc211("Pt", size=(6, 4, 4), vacuum=12.0)
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="adaptive").build_context(slab)
+        self.assertEqual(len(ctx.detection.surface_atom_ids), 24)
+        z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
+        self.assertEqual(len(np.unique(z)), 3)
+        self.assertEqual(ctx.detection.diagnostics.get("adaptive_target_decision"), "keep_multilevel")
+        self.assertIsNone(ctx.detection.diagnostics.get("target_mode"))
+
+    def test_adaptive_mode_keeps_multispecies_oxide_surface(self):
+        rutile = crystal(
+            symbols=["Ti", "O"],
+            basis=[(0.0, 0.0, 0.0), (0.305, 0.305, 0.0)],
+            spacegroup=136,
+            cellpar=[4.594, 4.594, 2.959, 90, 90, 90],
+        )
+        slab = surface(rutile, (1, 1, 0), layers=6, vacuum=12.0).repeat((2, 2, 1))
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="adaptive").build_context(slab)
+        self.assertEqual(len(ctx.detection.surface_atom_ids), 24)
+        self.assertEqual(ctx.detection.diagnostics.get("adaptive_target_decision"), "skip_surface_multispecies")
+
+    def test_off_mode_prunes_low_exposure_layer_on_fcc110(self):
+        slab = fcc110("Pt", size=(4, 4, 4), vacuum=12.0)
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="off").build_context(slab)
+        self.assertEqual(len(ctx.detection.surface_atom_ids), 16)
+        z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
+        self.assertEqual(len(np.unique(z)), 1)
+        self.assertEqual(ctx.detection.diagnostics.get("exposure_level_filter"), "applied")
+
+    def test_off_mode_keeps_stepped_levels_on_fcc211(self):
+        slab = fcc211("Pt", size=(6, 4, 4), vacuum=12.0)
+        ctx = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="off").build_context(slab)
+        self.assertEqual(len(ctx.detection.surface_atom_ids), 24)
+        z = np.round(slab.get_positions()[ctx.detection.surface_atom_ids, int(ctx.classification.normal_axis)], 6)
+        self.assertEqual(len(np.unique(z)), 3)
+        self.assertIn(ctx.detection.diagnostics.get("exposure_level_filter"), {"applied", "unchanged"})
+
+    def test_oxide_surface_filter_removes_deep_outliers_without_upsampling(self):
+        rutile = crystal(
+            symbols=["Ti", "O"],
+            basis=[(0.0, 0.0, 0.0), (0.305, 0.305, 0.0)],
+            spacegroup=136,
+            cellpar=[4.594, 4.594, 2.959, 90, 90, 90],
+        )
+        slab = surface(rutile, (1, 1, 0), layers=6, vacuum=12.0).repeat((2, 2, 1))
+
+        ctx_off = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="off").build_context(slab)
+        z_off = np.round(slab.get_positions()[ctx_off.detection.surface_atom_ids, int(ctx_off.classification.normal_axis)], 6)
+        symbols_off = {slab[int(i)].symbol for i in ctx_off.detection.surface_atom_ids}
+        self.assertEqual(len(ctx_off.detection.surface_atom_ids), 24)
+        self.assertEqual(len(np.unique(z_off)), 3)
+        self.assertGreater(float(np.min(z_off)), 28.0)
+        self.assertEqual(ctx_off.detection.diagnostics.get("exposure_level_filter"), "applied")
+        self.assertEqual(ctx_off.detection.diagnostics.get("subsurface_species_rescue"), "applied")
+        self.assertEqual(symbols_off, {"O", "Ti"})
+
+        ctx_fixed = SurfacePreprocessor(min_surface_atoms=6, target_count_mode="fixed").build_context(slab)
+        z_fixed = np.round(slab.get_positions()[ctx_fixed.detection.surface_atom_ids, int(ctx_fixed.classification.normal_axis)], 6)
+        symbols_fixed = {slab[int(i)].symbol for i in ctx_fixed.detection.surface_atom_ids}
+        self.assertEqual(len(ctx_fixed.detection.surface_atom_ids), 24)
+        self.assertEqual(len(np.unique(z_fixed)), 3)
+        self.assertTrue(bool(ctx_fixed.detection.diagnostics.get("target_count_upsample_skipped")))
+        self.assertEqual(int(ctx_fixed.detection.diagnostics.get("target_surface_count", -1)), 36)
+        self.assertEqual(symbols_fixed, {"O", "Ti"})
 
     def test_selection_strategies(self):
         energies = np.array([0.0, 0.03, 0.10, 0.35, 0.36], dtype=float)

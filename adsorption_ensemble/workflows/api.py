@@ -9,7 +9,11 @@ from ase import Atoms
 from adsorption_ensemble.selection import StageSelectionConfig
 from adsorption_ensemble.workflows.adsorption import AdsorptionWorkflowResult, run_adsorption_workflow
 from adsorption_ensemble.workflows.paper_readiness import PaperReadinessReport, evaluate_adsorption_workflow_readiness
-from adsorption_ensemble.workflows.presets import make_adsorption_workflow_config
+from adsorption_ensemble.workflows.presets import (
+    DEFAULT_BASIN_DEDUP_METRIC,
+    DEFAULT_BASIN_SIGNATURE_MODE,
+    make_adsorption_workflow_config,
+)
 
 
 @dataclass
@@ -249,8 +253,8 @@ class AdsorptionEnsembleRequest:
     work_dir: str | Path
     placement_mode: str = "anchor_free"
     schedule: SamplingSchedule = field(default_factory=SamplingSchedule)
-    dedup_metric: str = "binding_surface_distance"
-    signature_mode: str = "provenance"
+    dedup_metric: str = DEFAULT_BASIN_DEDUP_METRIC
+    signature_mode: str = DEFAULT_BASIN_SIGNATURE_MODE
     pose_overrides: dict[str, Any] = field(default_factory=dict)
     basin_overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -271,8 +275,8 @@ def generate_adsorption_ensemble(
     work_dir: str | Path,
     placement_mode: str = "anchor_free",
     schedule: SamplingSchedule | None = None,
-    dedup_metric: str = "binding_surface_distance",
-    signature_mode: str = "provenance",
+    dedup_metric: str = DEFAULT_BASIN_DEDUP_METRIC,
+    signature_mode: str = DEFAULT_BASIN_SIGNATURE_MODE,
     pose_overrides: dict[str, Any] | None = None,
     basin_overrides: dict[str, Any] | None = None,
     basin_relax_backend: object | None = None,

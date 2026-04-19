@@ -20,7 +20,7 @@ from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
 from adsorption_ensemble.pose.postprocess import run_iterative_pose_fps_preselection
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.site import PrimitiveBuilder, PrimitiveEmbedder, PrimitiveEmbeddingConfig
-from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
+from adsorption_ensemble.workflows import make_default_surface_preprocessor
 from tests.chemistry_cases import get_test_adsorbate_cases
 
 
@@ -81,13 +81,7 @@ def build_pose_pool(
     max_selected_primitives: int,
     pose_cfg: PoseSamplerConfig,
 ) -> tuple[list[Atoms], int, int]:
-    pre = SurfacePreprocessor(
-        min_surface_atoms=6,
-        primary_detector=ProbeScanDetector(grid_step=0.6),
-        fallback_detector=VoxelFloodDetector(spacing=0.8),
-        target_surface_fraction=None,
-        target_count_mode="off",
-    )
+    pre = make_default_surface_preprocessor()
     ctx = pre.build_context(slab)
     raw_primitives = PrimitiveBuilder().build(slab, ctx)
     z = slab.get_atomic_numbers().astype(float)

@@ -125,7 +125,26 @@ def get_mace_calc(
 class IdentityRelaxBackend:
     def relax(self, frames: list[Atoms], maxf: float, steps: int, work_dir: Path | None = None) -> tuple[list[Atoms], np.ndarray, str]:
         out = [a.copy() for a in frames]
-        e = np.zeros(len(out), dtype=float)
+        energies: list[float] = []
+        for frame in frames:
+            energy = float("nan")
+            try:
+                energy = float(frame.get_potential_energy())
+            except Exception:
+                for key in ("energy", "energy_ev", "free_energy", "E"):
+                    value = frame.info.get(key, None)
+                    if value is None:
+                        continue
+                    try:
+                        energy = float(value)
+                    except Exception:
+                        continue
+                    if np.isfinite(energy):
+                        break
+            if not np.isfinite(energy):
+                energy = 0.0
+            energies.append(float(energy))
+        e = np.asarray(energies, dtype=float)
         return out, e, "identity"
 
 

@@ -105,6 +105,7 @@ class MACEBatchInferencer:
             "model_path": self.config.model_path,
             "device": self.config.device,
             "dtype": self.config.dtype,
+            "enable_cueq": bool(self.config.enable_cueq),
             "max_edges_per_batch": self.config.max_edges_per_batch,
             "layers_to_keep": self.config.layers_to_keep,
             "head_name": head_name_use,
@@ -183,6 +184,7 @@ class MACEBatchInferencer:
             "model_path": self.config.model_path,
             "device": self.config.device,
             "dtype": self.config.dtype,
+            "enable_cueq": bool(self.config.enable_cueq),
             "max_edges_per_batch": self.config.max_edges_per_batch,
             "layers_to_keep": self.config.layers_to_keep,
             "head_name": head_name_use,
@@ -205,7 +207,18 @@ class MACEBatchInferencer:
             raise ValueError("MACE model_path is required for mace backend.")
         model = torch.load(self.config.model_path, map_location=self.config.device)
         model = model.float() if self.config.dtype == "float32" else model.double()
-        model.to(self.config.device).eval()
+        model = model.to(self.config.device)
+        if bool(self.config.enable_cueq) and str(self.config.device).lower().startswith("cuda"):
+            try:
+                from mace.calculators.mace import run_e3nn_to_cueq
+            except Exception as exc:
+                raise RuntimeError("enable_cueq=True but CuEq conversion is unavailable for MACE inference.") from exc
+            model = run_e3nn_to_cueq(model, device=self.config.device).to(self.config.device)
+        if str(self.config.device).lower().startswith("cuda"):
+            model._enable_amp = False
+        for param in model.parameters():
+            param.requires_grad = False
+        model.eval()
         self._model = model
         return model
 

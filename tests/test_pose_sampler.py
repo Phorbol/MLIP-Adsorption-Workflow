@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 from ase import Atoms
@@ -141,10 +142,141 @@ class TestPoseSampler(unittest.TestCase):
         self.assertEqual({int(p.azimuth_index) for p in out}, {0})
         self.assertEqual({int(p.rotation_index) for p in out}, {0})
 
-    def test_pose_sampler_covers_multicenter_sites_for_monatomic_adsorbate(self):
+    def test_pose_sampler_adaptive_height_fallback_recovers_zero_pose_primitive(self):
+        slab, ads, surface_ids, primitives = self._prepare_inputs()
+        base_cfg = PoseSamplerConfig(
+            n_rotations=1,
+            n_azimuth=1,
+            n_shifts=1,
+            shift_radius=0.0,
+            n_height_shifts=1,
+            min_height=1.2,
+            max_height=1.2,
+            height_step=0.1,
+            max_poses_per_site=None,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+            adaptive_height_fallback=False,
+            adaptive_height_fallback_step=0.2,
+            adaptive_height_fallback_max_extra=0.8,
+            adaptive_height_fallback_contact_slack=0.4,
+        )
+        adaptive_cfg = PoseSamplerConfig(**{**vars(base_cfg), "adaptive_height_fallback": True})
+
+        def fake_solve_height(self, **kwargs):
+            return 1.2
+
+        def fake_check_clash(self, placed_pos, tau):
+            return bool(np.min(np.asarray(placed_pos, dtype=float)[:, 2]) < 20.0)
+
+        with mock.patch.object(PoseSampler, "_solve_height", fake_solve_height), mock.patch.object(
+            PoseSampler, "_check_clash_positions", fake_check_clash
+        ):
+            out_base = PoseSampler(base_cfg).sample(
+                slab=slab,
+                adsorbate=ads,
+                primitives=[primitives[0]],
+                surface_atom_ids=surface_ids,
+            )
+            out_adaptive = PoseSampler(adaptive_cfg).sample(
+                slab=slab,
+                adsorbate=ads,
+                primitives=[primitives[0]],
+                surface_atom_ids=surface_ids,
+            )
+        self.assertEqual(len(out_base), 0)
+        self.assertGreaterEqual(len(out_adaptive), 1)
+        self.assertGreater(out_adaptive[0].height, base_cfg.max_height)
+
+    def test_linear_quaternion_schedule_spans_high_tilts_with_small_rotation_budget(self):
+        slab = fcc111("Pt", size=(3, 3, 4), vacuum=12.0)
+        ads = molecule("C2H2")
+        ctx = self.pre.build_context(slab)
+        primitive = self.builder.build(slab, ctx)[0]
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4, random_seed=0))
+        mol_class = sampler._classify_molecule_shape(ads)
+        quats = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads.copy(),
+            normal=np.asarray(primitive.normal, dtype=float),
+            mol_class=mol_class,
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        tilts = []
+        for quat in quats:
+            rotated = sampler._rotated_adsorbate(ads.copy(), quat)
+            tilts.append(sampler._estimate_tilt_deg(rotated, np.asarray(primitive.normal, dtype=float)))
+        self.assertEqual(len(quats), 4)
+        self.assertGreaterEqual(max(tilts), 45.0)
+        self.assertGreaterEqual(sum(1 for t in tilts if t >= 30.0), 2)
+
+    def test_pose_sampler_adaptive_height_fallback_recovers_clashing_candidate_even_when_some_exist(self):
+        slab, ads, surface_ids, primitives = self._prepare_inputs()
+        base_cfg = PoseSamplerConfig(
+            n_rotations=2,
+            n_azimuth=1,
+            n_shifts=1,
+            shift_radius=0.0,
+            n_height_shifts=1,
+            min_height=1.2,
+            max_height=1.2,
+            height_step=0.1,
+            max_poses_per_site=None,
+            prune_com_distance=0.0,
+            prune_rot_distance=0.0,
+            random_seed=0,
+            adaptive_height_fallback=False,
+            adaptive_height_fallback_step=0.2,
+            adaptive_height_fallback_max_extra=0.8,
+            adaptive_height_fallback_contact_slack=0.4,
+        )
+        adaptive_cfg = PoseSamplerConfig(**{**vars(base_cfg), "adaptive_height_fallback": True})
+        q_ident = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+
+        def fake_quats(self, adsorbate_centered, normal, mol_class, rng, n_rot):
+            return [q_ident.copy(), q_ident.copy()]
+
+        def fake_solve_height(self, **kwargs):
+            return 1.2
+
+        calls = {"n": 0}
+
+        def fake_check_clash(self, placed_pos, tau):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return True
+            return False
+
+        def fake_min_dist(self, placed_pos, site_ids_local):
+            return 1.2, 1.2
+
+        with (
+            mock.patch.object(PoseSampler, "_build_site_oriented_quaternions", fake_quats),
+            mock.patch.object(PoseSampler, "_solve_height", fake_solve_height),
+            mock.patch.object(PoseSampler, "_check_clash_positions", fake_check_clash),
+            mock.patch.object(PoseSampler, "_min_scaled_distance_site_and_surface", fake_min_dist),
+        ):
+            out_base = PoseSampler(base_cfg).sample(
+                slab=slab,
+                adsorbate=ads,
+                primitives=[primitives[0]],
+                surface_atom_ids=surface_ids,
+            )
+            calls["n"] = 0
+            out_adaptive = PoseSampler(adaptive_cfg).sample(
+                slab=slab,
+                adsorbate=ads,
+                primitives=[primitives[0]],
+                surface_atom_ids=surface_ids,
+            )
+        self.assertEqual(len(out_base), 1)
+        self.assertEqual(len(out_adaptive), 2)
+
+    def test_pose_sampler_covers_multicenter_site_kinds_for_monatomic_adsorbate(self):
         cases = [
-            (fcc100("Pt", size=(4, 4, 4), vacuum=12.0), 3),
-            (fcc110("Pt", size=(4, 4, 4), vacuum=12.0), 4),
+            (fcc100("Pt", size=(4, 4, 4), vacuum=12.0), {"1c", "2c", "4c"}),
+            (fcc110("Pt", size=(4, 4, 4), vacuum=12.0), {"1c", "2c", "4c"}),
         ]
         ads = Atoms("H", positions=[[0.0, 0.0, 0.0]])
         cfg = PoseSamplerConfig(
@@ -165,9 +297,64 @@ class TestPoseSampler(unittest.TestCase):
             ctx = self.pre.build_context(slab)
             primitives = self.builder.build(slab, ctx)
             out = sampler.sample(slab=slab, adsorbate=ads, primitives=primitives, surface_atom_ids=ctx.detection.surface_atom_ids)
-            self.assertEqual(len({int(p.primitive_index) for p in out}), expected_n_sites)
+            sampled_kinds = {primitives[int(p.primitive_index)].kind for p in out}
+            self.assertSetEqual(sampled_kinds, expected_n_sites)
 
-    def test_linear_adsorbate_site_oriented_quaternions_include_surface_normal(self):
+    def test_pose_sampler_orthogonal_fast_path_hook_preserves_results(self):
+        slab = fcc100("Pt", size=(3, 3, 4), vacuum=12.0)
+        ctx = self.pre.build_context(slab)
+        primitives = self.builder.build(slab, ctx)
+        ads = molecule("CO")
+        cfg = PoseSamplerConfig(
+            n_rotations=2,
+            n_azimuth=4,
+            n_shifts=1,
+            shift_radius=0.0,
+            min_height=1.0,
+            max_height=2.8,
+            height_step=0.1,
+            random_seed=0,
+            max_poses_per_site=3,
+        )
+        baseline = PoseSampler(cfg).sample(
+            slab=slab,
+            adsorbate=ads,
+            primitives=primitives[:2],
+            surface_atom_ids=ctx.detection.surface_atom_ids,
+        )
+        calls = {"n": 0}
+
+        def fake_kernel(placed_pos, surf_frac, inv_cell, lengths, pbc_mask, denom2, site_ids_local):
+            calls["n"] += 1
+            ads_frac = np.asarray(placed_pos @ inv_cell, dtype=float)
+            df = surf_frac[None, :, :] - ads_frac[:, None, :]
+            for ax in range(3):
+                if bool(pbc_mask[ax]):
+                    df[:, :, ax] = df[:, :, ax] - np.round(df[:, :, ax])
+            d0 = df[:, :, 0] * float(lengths[0])
+            d1 = df[:, :, 1] * float(lengths[1])
+            d2 = df[:, :, 2] * float(lengths[2])
+            dist2 = d0 * d0 + d1 * d1 + d2 * d2
+            min_surface2 = float(np.min(dist2 / denom2))
+            if len(site_ids_local) == 0:
+                return np.inf, min_surface2
+            cols = np.asarray(site_ids_local, dtype=int)
+            min_site2 = float(np.min(dist2[:, cols] / denom2[:, cols]))
+            return min_site2, min_surface2
+
+        with mock.patch("adsorption_ensemble.pose.sampler._get_pose_orthogonal_min_ratio_kernel", return_value=fake_kernel):
+            accelerated = PoseSampler(cfg).sample(
+                slab=slab,
+                adsorbate=ads,
+                primitives=primitives[:2],
+                surface_atom_ids=ctx.detection.surface_atom_ids,
+            )
+        self.assertGreater(calls["n"], 0)
+        self.assertEqual(len(accelerated), len(baseline))
+        self.assertEqual([int(p.primitive_index) for p in accelerated], [int(p.primitive_index) for p in baseline])
+        self.assertTrue(np.allclose([float(p.height) for p in accelerated], [float(p.height) for p in baseline], atol=1e-8))
+
+    def test_linear_adsorbate_site_oriented_quaternions_include_surface_normal_with_small_budget(self):
         ads = molecule("CO")
         ads.positions = ads.positions - ads.get_center_of_mass()
         sampler = PoseSampler(PoseSamplerConfig(n_rotations=2))
@@ -180,15 +367,18 @@ class TestPoseSampler(unittest.TestCase):
         )
         self.assertEqual(len(quats), 2)
         vectors = []
+        alignments = []
         for q in quats:
             rotated = sampler._rotated_adsorbate(ads, q)
             axis = sampler._principal_axis(rotated)
             self.assertIsNotNone(axis)
-            self.assertGreater(abs(float(np.dot(axis, np.array([0.0, 0.0, 1.0], dtype=float)))), 1.0 - 1e-6)
+            alignments.append(abs(float(np.dot(axis, np.array([0.0, 0.0, 1.0], dtype=float)))))
             vec = np.asarray(rotated.positions[1] - rotated.positions[0], dtype=float)
             vec = vec / (np.linalg.norm(vec) + 1e-12)
             vectors.append(vec)
-        self.assertLess(float(np.dot(vectors[0], vectors[1])), -1.0 + 1e-6)
+        self.assertTrue(any(v >= 0.99 for v in alignments))
+        self.assertTrue(any(0.80 <= v <= 0.99 for v in alignments))
+        self.assertLess(float(np.dot(vectors[0], vectors[1])), -0.80)
 
     def test_linear_adsorbate_site_oriented_quaternions_include_tilted_states_when_budget_allows(self):
         ads = molecule("CO")

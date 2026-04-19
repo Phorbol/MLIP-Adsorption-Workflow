@@ -138,7 +138,7 @@ def build_slab_suite() -> dict[str, Atoms]:
 
 
 def build_molecule_suite(max_atoms: int = 40) -> dict[str, Atoms]:
-    out: dict[str, Atoms] = {}
+    out: dict[str, Atoms] = {"H": Atoms("H", positions=[[0.0, 0.0, 0.0]])}
     for name in sorted(g2.names):
         try:
             a = g2[name].copy()
@@ -150,7 +150,23 @@ def build_molecule_suite(max_atoms: int = 40) -> dict[str, Atoms]:
     return out
 
 
-def _run_our_site_pipeline(slab: Atoms, out_dir: Path) -> dict[str, Any]:
+def _select_requested_names(
+    suite: dict[str, Any],
+    requested: list[str] | None,
+    max_items: int,
+) -> list[str]:
+    if requested:
+        unknown = [str(name) for name in requested if str(name) not in suite]
+        if unknown:
+            raise ValueError(f"Unknown requested names: {unknown}")
+        return [str(name) for name in requested]
+    names = sorted(suite.keys())
+    if int(max_items) > 0:
+        names = names[: int(max_items)]
+    return names
+
+
+def _run_our_site_pipeline(slab: Atoms, out_dir: Path, *, save_visuals: bool = True) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     ctx = SurfacePreprocessor(min_surface_atoms=6).build_context(slab)
     raw = PrimitiveBuilder().build(slab, ctx)
@@ -164,11 +180,12 @@ def _run_our_site_pipeline(slab: Atoms, out_dir: Path) -> dict[str, Any]:
 
     raw_counts = Counter([str(p.kind) for p in emb.primitives])
     basis_counts = Counter([str(p.kind) for p in emb.basis_primitives])
-    _write_json(out_dir / "raw_site_dictionary.json", build_site_dictionary(emb.primitives))
-    _write_json(out_dir / "selected_site_dictionary.json", build_site_dictionary(emb.basis_primitives))
-    plot_surface_primitives_2d(slab=slab, context=ctx, primitives=emb.primitives, filename=out_dir / "sites.png")
-    plot_site_centers_only(slab=slab, primitives=emb.primitives, filename=out_dir / "sites_only.png")
-    plot_inequivalent_sites_2d(slab=slab, primitives=emb.primitives, filename=out_dir / "sites_inequivalent.png")
+    _write_json(out_dir / "raw_site_dictionary.json", build_site_dictionary(emb.primitives, slab=slab))
+    _write_json(out_dir / "selected_site_dictionary.json", build_site_dictionary(emb.basis_primitives, slab=slab))
+    if bool(save_visuals):
+        plot_surface_primitives_2d(slab=slab, context=ctx, primitives=emb.primitives, filename=out_dir / "sites.png")
+        plot_site_centers_only(slab=slab, primitives=emb.primitives, filename=out_dir / "sites_only.png")
+        plot_inequivalent_sites_2d(slab=slab, primitives=emb.primitives, filename=out_dir / "sites_inequivalent.png")
 
     return {
         "n_atoms": int(len(slab)),
@@ -343,19 +360,15 @@ def run(args: argparse.Namespace) -> Path:
     out_root.mkdir(parents=True, exist_ok=True)
     slabs = build_slab_suite()
     molecules = build_molecule_suite(max_atoms=int(args.max_molecule_atoms))
-    slab_names = sorted(slabs.keys())
-    mol_names = sorted(molecules.keys())
-    if int(args.max_slabs) > 0:
-        slab_names = slab_names[: int(args.max_slabs)]
-    if int(args.max_molecules) > 0:
-        mol_names = mol_names[: int(args.max_molecules)]
+    slab_names = _select_requested_names(slabs, args.slab_names, int(args.max_slabs))
+    mol_names = _select_requested_names(molecules, args.molecule_names, int(args.max_molecules))
 
     slab_rows: list[dict[str, Any]] = []
     slab_cache: dict[str, dict[str, Any]] = {}
     for slab_name in slab_names:
         slab = slabs[slab_name]
         slab_dir = out_root / "slabs" / slab_name
-        ours = _run_our_site_pipeline(slab, slab_dir)
+        ours = _run_our_site_pipeline(slab, slab_dir, save_visuals=bool(args.save_visuals))
         ours_counts = ours["basis_counts"]
         ase_ref = _ase_reference_counts(slab)
         ase_match = None
@@ -480,14 +493,18 @@ def run(args: argparse.Namespace) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-root", type=str, default="artifacts/autoresearch/physics_audit/ase_full_matrix")
+    parser.add_argument("--slab-names", nargs="*", default=None)
+    parser.add_argument("--molecule-names", nargs="*", default=None)
     parser.add_argument("--max-slabs", type=int, default=0)
     parser.add_argument("--max-molecules", type=int, default=0)
     parser.add_argument("--max-molecule-atoms", type=int, default=40)
     parser.add_argument("--min-accepted-distance", type=float, default=0.70)
     parser.add_argument("--skip-autoadsorbate", action="store_true")
+    parser.add_argument("--save-visuals", dest="save_visuals", action="store_true")
+    parser.add_argument("--no-save-visuals", dest="save_visuals", action="store_false")
     parser.add_argument("--save-sample-placements", dest="save_sample_placements", action="store_true")
     parser.add_argument("--no-save-sample-placements", dest="save_sample_placements", action="store_false")
-    parser.set_defaults(save_sample_placements=True)
+    parser.set_defaults(save_visuals=True, save_sample_placements=True)
     args = parser.parse_args()
     out_path = run(args)
     print(out_path.as_posix())

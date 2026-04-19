@@ -52,16 +52,22 @@ python tools/run_pose_sampling_sweep.py ^
   --max-molecules 1 ^
   --max-slabs 1 ^
   --max-combinations 1 ^
+  --mace-model-path /root/.cache/mace/mace-omat-0-small.model ^
+  --mace-desc-device cuda ^
+  --mace-desc-dtype float64 ^
   --postprocess-enabled ^
   --ensemble-enabled ^
   --ensemble-relax-backend mace_batch ^
-  --ensemble-dedup-metric rmsd
+  --ensemble-dedup-metric mace_node_l2 ^
+  --ensemble-mace-node-l2-threshold 0.20
 ```
 
 每个 case（`<run_dir>/<slab>/<mol>/`）会产出：
 - `pose_pool.extxyz`：原始姿态池
 - `pose_final.extxyz` + 若干 PCA/直方图：postprocess 结果（如果启用）
 - `basins.extxyz / basins.json / nodes.json`：吸附系综结果（如果启用 ensemble）
+
+如果你只是做无 MACE 的 smoke run，可以把 `--ensemble-dedup-metric` 改回 `rmsd`，并去掉 `--mace-model-path / --mace-desc-*`。
 
 ## 2) 在 WSL + MACE 模型下跑 GPU（推荐跑法）
 

@@ -84,6 +84,7 @@ def _default_ablation_configs(*, model_path: str | None, device: str, dtype: str
         "mace_model_path": model_path,
         "mace_device": str(device),
         "mace_dtype": str(dtype),
+        "mace_enable_cueq": True,
     }
     return {
         "signature_only": BasinConfig(
@@ -183,8 +184,8 @@ def _write_report(out_root: Path, rows: list[dict[str, Any]], *, schedule_name: 
         "- post_relax_selection: energy window + RMSD window",
         "- final_dedup_stage1: `binding_surface_distance + greedy`",
         "- final_dedup_stage1_params: `nearest_k=8`, `threshold=0.30`, `binding_only`, `relative=False`, `rmsd_gate=0.25`",
-        "- final_dedup_stage2: `pure_mace basin merge + hierarchical`",
-        "- final_dedup_stage2_params: `node_l2_threshold=0.20`, `mean_atom`",
+        "- final_dedup_stage2: `canonical-grouped MACE basin merge + hierarchical`",
+        "- final_dedup_stage2_params: `node_l2_threshold=0.20`, `mean_atom`, `signature_mode=canonical`",
         "",
         "## Case Summary",
         "",

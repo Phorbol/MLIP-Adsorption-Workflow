@@ -7,6 +7,7 @@ import numpy as np
 from ase import Atom, Atoms
 from ase.build import add_adsorbate
 
+from adsorption_ensemble.site.delaunay import enumerate_primitives_delaunay
 from adsorption_ensemble.surface.graph import ExposedSurfaceGraph
 from adsorption_ensemble.surface.pipeline import SurfaceContext
 
@@ -154,7 +155,12 @@ class PrimitiveBuilder:
         min_polygon_area: float = 0.05,
         min_center_surface_distance: float = 0.20,
         center_surface_distance_factor: float = 0.35,
-        use_ase_reference_sites: bool = True,
+        use_ase_reference_sites: bool = False,
+        augment_row_like_surface_graph: bool = True,
+        row_like_degree_threshold: float = 2.5,
+        row_like_second_shell_ratio: float = 1.50,
+        row_like_shell_tolerance: float = 0.08,
+        max_fourfold_level_span_factor: float = 0.35,
     ):
         self.enumerator = enumerator or PrimitiveEnumerator()
         self.frame_builder = frame_builder or LocalFrameBuilder()
@@ -163,6 +169,11 @@ class PrimitiveBuilder:
         self.min_center_surface_distance = min_center_surface_distance
         self.center_surface_distance_factor = center_surface_distance_factor
         self.use_ase_reference_sites = use_ase_reference_sites
+        self.augment_row_like_surface_graph = bool(augment_row_like_surface_graph)
+        self.row_like_degree_threshold = float(row_like_degree_threshold)
+        self.row_like_second_shell_ratio = float(row_like_second_shell_ratio)
+        self.row_like_shell_tolerance = float(row_like_shell_tolerance)
+        self.max_fourfold_level_span_factor = float(max_fourfold_level_span_factor)
 
     def build(self, slab: Atoms, context: SurfaceContext) -> list[SitePrimitive]:
         normal_axis = context.classification.normal_axis
@@ -170,12 +181,101 @@ class PrimitiveBuilder:
             raise ValueError("SurfaceContext does not have a valid normal axis.")
         global_normal = np.zeros(3, dtype=float)
         global_normal[normal_axis] = 1.0
-        groups = self.enumerator.enumerate(context.graph)
+        graph = self._prepare_enumeration_graph(slab=slab, graph=context.graph)
+        groups = self.enumerator.enumerate(graph)
+        if self._should_use_delaunay_fallback(groups, context):
+            try:
+                groups = enumerate_primitives_delaunay(
+                    slab=slab,
+                    surface_atom_ids=list(context.detection.surface_atom_ids),
+                    normal_axis=int(context.classification.normal_axis),
+                )
+            except ImportError:
+                pass
+        primitives = self._build_from_groups(
+            slab=slab,
+            groups=groups,
+            graph=graph,
+            global_normal=global_normal,
+            normal_axis=int(context.classification.normal_axis),
+            surface_ids=list(context.detection.surface_atom_ids),
+        )
+        return primitives
+
+    def _prepare_enumeration_graph(self, slab: Atoms, graph: ExposedSurfaceGraph) -> ExposedSurfaceGraph:
+        if not bool(self.augment_row_like_surface_graph):
+            return graph
+        ids = list(graph.surface_atom_ids)
+        if len(ids) < 4 or len(graph.edges) == 0:
+            return graph
+        degrees = np.asarray([len(graph.neighbors[i]) for i in ids], dtype=float)
+        if degrees.size == 0 or float(np.mean(degrees)) > float(self.row_like_degree_threshold):
+            return graph
+        edge_distances = np.asarray([slab.get_distance(int(i), int(j), mic=True) for i, j in graph.edges], dtype=float)
+        edge_distances = edge_distances[np.isfinite(edge_distances) & (edge_distances > 1.0e-8)]
+        if edge_distances.size == 0:
+            return graph
+        first_shell = float(np.median(edge_distances))
+        cutoff = float(self.row_like_second_shell_ratio) * first_shell
+        edge_set = {tuple(sorted((int(i), int(j)))) for i, j in graph.edges}
+        candidate_pairs: list[tuple[float, int, int]] = []
+        for i, j in combinations(sorted(int(x) for x in ids), 2):
+            key = (int(i), int(j))
+            if key in edge_set:
+                continue
+            dist = float(slab.get_distance(int(i), int(j), mic=True))
+            if not np.isfinite(dist) or dist <= first_shell * (1.0 + 1.0e-3) or dist > cutoff:
+                continue
+            candidate_pairs.append((dist, int(i), int(j)))
+        if not candidate_pairs:
+            return graph
+        candidate_pairs.sort(key=lambda row: row[0])
+        shells: list[list[tuple[float, int, int]]] = []
+        for row in candidate_pairs:
+            if not shells:
+                shells.append([row])
+                continue
+            ref = float(np.median([x[0] for x in shells[-1]]))
+            tol = max(1.0e-3, float(self.row_like_shell_tolerance) * ref)
+            if abs(float(row[0]) - ref) <= tol:
+                shells[-1].append(row)
+            else:
+                shells.append([row])
+        if not shells:
+            return graph
+        chosen = shells[0]
+        second_shell = float(np.median([x[0] for x in chosen]))
+        if second_shell > cutoff:
+            return graph
+        min_pairs = max(2, len(ids) // 4)
+        if len(chosen) < min_pairs:
+            return graph
+        new_edges = set(edge_set)
+        new_neighbors: dict[int, set[int]] = {int(i): set(int(j) for j in graph.neighbors[i]) for i in ids}
+        for _, i, j in chosen:
+            new_edges.add((int(i), int(j)))
+            new_neighbors[int(i)].add(int(j))
+            new_neighbors[int(j)].add(int(i))
+        return ExposedSurfaceGraph(
+            surface_atom_ids=sorted(int(i) for i in ids),
+            edges=sorted(new_edges),
+            neighbors=new_neighbors,
+        )
+
+    def _build_from_groups(
+        self,
+        slab: Atoms,
+        groups: dict[str, list[tuple[int, ...]]],
+        graph: ExposedSurfaceGraph,
+        global_normal: np.ndarray,
+        normal_axis: int,
+        surface_ids: list[int],
+    ) -> list[SitePrimitive]:
         primitives: list[SitePrimitive] = []
         for kind in ("1c", "2c", "3c", "4c"):
-            for atom_ids in groups[kind]:
+            for atom_ids in groups.get(kind, []):
                 center, normal, t1, t2 = self.frame_builder.build(slab=slab, atom_ids=atom_ids, global_normal=global_normal)
-                topo_hash = self._make_topo_hash(kind, atom_ids, context.graph)
+                topo_hash = self._make_topo_hash(kind, atom_ids, graph)
                 primitives.append(
                     SitePrimitive(
                         kind=kind,
@@ -188,23 +288,15 @@ class PrimitiveBuilder:
                         site_label=None,
                     )
                 )
-        primitives = self._prune_by_geometry(
-            primitives,
-            slab,
-            context.classification.normal_axis,
-            context.detection.surface_atom_ids,
-        )
+        primitives = self._prune_by_geometry(primitives, slab, normal_axis, surface_ids)
         primitives = self._prune_by_center_distance(primitives, slab)
-        if self.use_ase_reference_sites:
-            ref = self._build_from_ase_reference_sites(
-                slab=slab,
-                normal_axis=int(context.classification.normal_axis),
-                surface_ids=list(context.detection.surface_atom_ids),
-                graph=context.graph,
-            )
-            if ref is not None and len(ref) > 0:
-                return ref
         return primitives
+
+    @staticmethod
+    def _should_use_delaunay_fallback(groups: dict[str, list[tuple[int, ...]]], context: SurfaceContext) -> bool:
+        surface_n = len(context.detection.surface_atom_ids)
+        multi_atom_count = sum(len(groups.get(kind, [])) for kind in ("2c", "3c", "4c"))
+        return surface_n >= 4 and (len(context.graph.edges) == 0 or multi_atom_count == 0)
 
     def _build_from_ase_reference_sites(
         self,
@@ -323,13 +415,17 @@ class PrimitiveBuilder:
         dyn_center_cut = max(self.min_center_surface_distance, self.center_surface_distance_factor * nn) if np.isfinite(nn) else self.min_center_surface_distance
         kept: list[SitePrimitive] = []
         for p in primitives:
+            points_unwrapped = self._primitive_unwrapped_positions(slab, p.atom_ids)
             if p.kind in {"3c", "4c"}:
-                area = self._site_area(positions[list(p.atom_ids)], tangential_axes)
+                area = self._site_area(points_unwrapped, tangential_axes)
                 if area < self.min_polygon_area:
                     continue
             if p.kind == "4c":
-                max_dev = self._quad_max_angle_deviation_from_right(positions[list(p.atom_ids)], tangential_axes)
+                max_dev = self._quad_max_angle_deviation_from_right(points_unwrapped, tangential_axes)
                 if max_dev > 25.0:
+                    continue
+                max_level_span = float(self.max_fourfold_level_span_factor) * float(nn) if np.isfinite(nn) else 0.75
+                if np.ptp(points_unwrapped[:, normal_axis]) > max_level_span:
                     continue
             if len(p.atom_ids) >= 2:
                 dmin = self._point_to_surface_min_distance_mic(slab, p.center, surface_ids)
@@ -405,13 +501,25 @@ class PrimitiveBuilder:
                 dmin = d
         return float(dmin)
 
+    @staticmethod
+    def _primitive_unwrapped_positions(slab: Atoms, atom_ids: tuple[int, ...]) -> np.ndarray:
+        if len(atom_ids) <= 0:
+            return np.zeros((0, 3), dtype=float)
+        ref = int(atom_ids[0])
+        ref_pos = np.asarray(slab.positions[ref], dtype=float)
+        out = [ref_pos]
+        for idx in atom_ids[1:]:
+            vec = slab.get_distances(ref, int(idx), mic=True, vector=True)
+            out.append(ref_pos + np.asarray(vec, dtype=float).reshape(3))
+        return np.asarray(out, dtype=float)
+
     def _prune_by_center_distance(self, primitives: list[SitePrimitive], slab: Atoms) -> list[SitePrimitive]:
         if self.min_site_distance <= 0 or len(primitives) <= 1:
             return primitives
         order = sorted(
             range(len(primitives)),
             key=lambda i: (
-                {"1c": 0, "2c": 1, "3c": 2, "4c": 3}.get(str(primitives[i].kind), 99),
+                -{"1c": 0, "2c": 1, "3c": 2, "4c": 3}.get(str(primitives[i].kind), 99),
                 primitives[i].topo_hash,
                 -len(primitives[i].atom_ids),
             ),

@@ -34,7 +34,7 @@ def main() -> int:
         ensemble_energy_window_ev=3.0,
         ensemble_dedup_metric="mace_node_l2",
         ensemble_rmsd_threshold=0.10,
-        ensemble_mace_node_l2_threshold=2.0,
+        ensemble_mace_node_l2_threshold=0.20,
         ensemble_binding_tau=1.15,
         ensemble_desorption_min_bonds=1,
         node_bond_tau=1.20,

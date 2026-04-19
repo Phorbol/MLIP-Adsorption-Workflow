@@ -57,7 +57,9 @@ class BasinBuilder:
                 normal_axis=int(normal_axis),
                 binding_tau=float(cfg.binding_tau),
                 desorption_min_bonds=int(cfg.desorption_min_bonds),
+                desorption_contact_slack=float(cfg.desorption_contact_slack),
                 surface_reconstruction_max_disp=float(cfg.surface_reconstruction_max_disp),
+                surface_reconstruction_enabled=bool(cfg.surface_reconstruction_enabled),
                 dissociation_allow_bond_change=bool(cfg.dissociation_allow_bond_change),
                 burial_margin=float(cfg.burial_margin),
             )
@@ -135,6 +137,7 @@ class BasinBuilder:
                 slab_n=int(slab_n),
                 binding_tau=float(cfg.binding_tau),
                 signature_mode=str(cfg.signature_mode),
+                surface_reference=slab_ref,
             )
         elif dedup_metric in {"binding_surface", "binding_surface_distance", "surface_binding_distance", "binding_surface_descriptor"}:
             basins_raw, dedup_meta = cluster_by_binding_pattern_and_surface_distance(
@@ -163,6 +166,7 @@ class BasinBuilder:
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=True,
+                surface_reference=slab_ref,
             )
         elif dedup_metric in {"pure_rmsd", "rmsd_only"}:
             basins_raw = cluster_by_signature_and_rmsd(
@@ -176,6 +180,7 @@ class BasinBuilder:
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=False,
+                surface_reference=slab_ref,
             )
         else:
             basins_raw = cluster_by_signature_and_rmsd(
@@ -189,6 +194,7 @@ class BasinBuilder:
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=True,
+                surface_reference=slab_ref,
             )
         if dedup_metric in {"mace", "mace_node_l2", "mace_l2"}:
             basins_raw, dedup_meta = cluster_by_signature_and_mace_node_l2(
@@ -200,6 +206,7 @@ class BasinBuilder:
                 mace_model_path=cfg.mace_model_path,
                 mace_device=str(cfg.mace_device),
                 mace_dtype=str(cfg.mace_dtype),
+                mace_enable_cueq=bool(cfg.mace_enable_cueq),
                 mace_max_edges_per_batch=int(cfg.mace_max_edges_per_batch),
                 mace_layers_to_keep=int(cfg.mace_layers_to_keep),
                 mace_head_name=cfg.mace_head_name,
@@ -210,6 +217,7 @@ class BasinBuilder:
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=True,
+                surface_reference=slab_ref,
             )
         if dedup_metric in {"pure_mace", "pure_mace_l2", "mace_only"}:
             basins_raw, dedup_meta = cluster_by_signature_and_mace_node_l2(
@@ -221,6 +229,7 @@ class BasinBuilder:
                 mace_model_path=cfg.mace_model_path,
                 mace_device=str(cfg.mace_device),
                 mace_dtype=str(cfg.mace_dtype),
+                mace_enable_cueq=bool(cfg.mace_enable_cueq),
                 mace_max_edges_per_batch=int(cfg.mace_max_edges_per_batch),
                 mace_layers_to_keep=int(cfg.mace_layers_to_keep),
                 mace_head_name=cfg.mace_head_name,
@@ -231,6 +240,7 @@ class BasinBuilder:
                 fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
                 signature_mode=str(cfg.signature_mode),
                 use_signature_grouping=False,
+                surface_reference=slab_ref,
             )
         final_merge_metric = str(cfg.final_basin_merge_metric).strip().lower()
         final_merge_meta: dict = {
@@ -239,13 +249,27 @@ class BasinBuilder:
             "status": "disabled",
             "n_input_basins": int(len(basins_raw)),
             "n_output_basins": int(len(basins_raw)),
+            "energy_gate_ev": (
+                None
+                if cfg.final_basin_merge_energy_gate_ev is None
+                else float(cfg.final_basin_merge_energy_gate_ev)
+            ),
         }
         if basins_raw and final_merge_metric not in {"", "off", "none", "disabled"}:
             final_merge_meta["enabled"] = True
             final_merge_meta["n_input_basins"] = int(len(basins_raw))
+            ref_canonical_metrics = {
+                "reference_canonical_mace",
+                "ref_canonical_mace",
+                "auto_ref_canonical_mace",
+                "auto_reference_canonical_mace",
+            }
             threshold = cfg.final_basin_merge_node_l2_threshold
             if threshold is None:
-                threshold = float(cfg.mace_node_l2_threshold)
+                if final_merge_metric in ref_canonical_metrics:
+                    threshold = 0.02
+                else:
+                    threshold = float(cfg.mace_node_l2_threshold)
             cluster_method = (
                 str(cfg.final_basin_merge_cluster_method)
                 if cfg.final_basin_merge_cluster_method is not None and str(cfg.final_basin_merge_cluster_method).strip()
@@ -254,7 +278,34 @@ class BasinBuilder:
             model_path_use = cfg.mace_model_path
             device_use = str(cfg.mace_device)
             dtype_use = str(cfg.mace_dtype)
-            if final_merge_metric in {"auto", "auto_mace", "auto_pure_mace"}:
+            merge_signature_mode = cfg.final_basin_merge_signature_mode
+            merge_use_signature_grouping = cfg.final_basin_merge_use_signature_grouping
+            if merge_signature_mode is None:
+                if final_merge_metric in {"pure_mace", "auto_pure_mace"}:
+                    merge_signature_mode = "none"
+                elif final_merge_metric in ref_canonical_metrics:
+                    merge_signature_mode = "reference_canonical"
+                else:
+                    merge_signature_mode = "canonical"
+            if merge_use_signature_grouping is None:
+                merge_use_signature_grouping = final_merge_metric not in {"pure_mace", "auto_pure_mace"}
+            if final_merge_metric in ref_canonical_metrics and len(adsorbate_ref) <= 1:
+                final_merge_meta.update(
+                    {
+                        "status": "skipped_single_atom_adsorbate",
+                        "n_output_basins": int(len(basins_raw)),
+                        "node_l2_threshold": float(threshold),
+                        "cluster_method": str(cluster_method),
+                        "signature_mode": str(merge_signature_mode),
+                        "use_signature_grouping": bool(merge_use_signature_grouping),
+                        "energy_gate_ev": (
+                            None
+                            if cfg.final_basin_merge_energy_gate_ev is None
+                            else float(cfg.final_basin_merge_energy_gate_ev)
+                        ),
+                    }
+                )
+            elif final_merge_metric in {"auto", "auto_mace", "auto_pure_mace", "auto_ref_canonical_mace", "auto_reference_canonical_mace"}:
                 from adsorption_ensemble.relax.backends import normalize_mace_descriptor_config
 
                 model_path_use, device_use, dtype_use = normalize_mace_descriptor_config(
@@ -270,10 +321,36 @@ class BasinBuilder:
                             "n_output_basins": int(len(basins_raw)),
                             "node_l2_threshold": float(threshold),
                             "cluster_method": str(cluster_method),
+                            "signature_mode": str(merge_signature_mode),
+                            "use_signature_grouping": bool(merge_use_signature_grouping),
+                            "energy_gate_ev": (
+                                None
+                                if cfg.final_basin_merge_energy_gate_ev is None
+                                else float(cfg.final_basin_merge_energy_gate_ev)
+                            ),
                         }
                     )
-            if final_merge_metric in {"mace", "mace_node_l2", "mace_l2", "pure_mace", "auto", "auto_mace", "auto_pure_mace"} and (
-                final_merge_metric not in {"auto", "auto_mace", "auto_pure_mace"} or bool(model_path_use)
+            if (
+                final_merge_metric
+                in {
+                    "mace",
+                    "mace_node_l2",
+                    "mace_l2",
+                    "pure_mace",
+                    "auto",
+                    "auto_mace",
+                    "auto_pure_mace",
+                    "reference_canonical_mace",
+                    "ref_canonical_mace",
+                    "auto_ref_canonical_mace",
+                    "auto_reference_canonical_mace",
+                }
+                and (
+                    final_merge_metric
+                    not in {"auto", "auto_mace", "auto_pure_mace", "auto_ref_canonical_mace", "auto_reference_canonical_mace"}
+                    or bool(model_path_use)
+                )
+                and str(final_merge_meta.get("status", "")) not in {"skipped_single_atom_adsorbate", "skipped_no_model"}
             ):
                 try:
                     basins_raw, merge_meta = merge_basin_representatives_by_mace_node_l2(
@@ -284,6 +361,7 @@ class BasinBuilder:
                         mace_model_path=model_path_use,
                         mace_device=str(device_use),
                         mace_dtype=str(dtype_use),
+                        mace_enable_cueq=bool(cfg.mace_enable_cueq),
                         mace_max_edges_per_batch=int(cfg.mace_max_edges_per_batch),
                         mace_layers_to_keep=int(cfg.mace_layers_to_keep),
                         mace_head_name=cfg.mace_head_name,
@@ -292,8 +370,16 @@ class BasinBuilder:
                         l2_mode=str(cfg.mace_node_l2_mode),
                         fuzzy_sigma_scale=float(cfg.fuzzy_sigma_scale),
                         fuzzy_membership_cutoff=float(cfg.fuzzy_membership_cutoff),
+                        signature_mode=str(merge_signature_mode),
+                        use_signature_grouping=bool(merge_use_signature_grouping),
+                        surface_reference=slab_ref,
+                        energy_gate_ev=cfg.final_basin_merge_energy_gate_ev,
                     )
+                    backend_metric = merge_meta.get("metric")
                     final_merge_meta.update(dict(merge_meta))
+                    final_merge_meta["metric"] = str(cfg.final_basin_merge_metric)
+                    if backend_metric is not None:
+                        final_merge_meta["backend_metric"] = str(backend_metric)
                     final_merge_meta["status"] = "ok"
                 except Exception as exc:
                     if final_merge_metric in {"auto", "auto_mace", "auto_pure_mace"}:
@@ -305,6 +391,13 @@ class BasinBuilder:
                                 "n_output_basins": int(len(basins_raw)),
                                 "node_l2_threshold": float(threshold),
                                 "cluster_method": str(cluster_method),
+                                "signature_mode": str(merge_signature_mode),
+                                "use_signature_grouping": bool(merge_use_signature_grouping),
+                                "energy_gate_ev": (
+                                    None
+                                    if cfg.final_basin_merge_energy_gate_ev is None
+                                    else float(cfg.final_basin_merge_energy_gate_ev)
+                                ),
                             }
                         )
                     else:
