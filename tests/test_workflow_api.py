@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -9,6 +10,10 @@ from adsorption_ensemble.workflows import SamplingSchedule, generate_adsorption_
 
 
 class TestWorkflowAPI(unittest.TestCase):
+    @staticmethod
+    def _cpu_safe_basin_overrides() -> dict:
+        return {"dedup_metric": "rmsd", "final_basin_merge_metric": "off"}
+
     def test_generate_adsorption_ensemble_anchorfree(self):
         slab = fcc111("Pt", size=(3, 3, 4), vacuum=12.0)
         ads = molecule("CO")
@@ -19,6 +24,7 @@ class TestWorkflowAPI(unittest.TestCase):
                 work_dir=Path(td) / "anchorfree",
                 placement_mode="anchor_free",
                 schedule=SamplingSchedule(name="smoke", exhaustive_pose_sampling=False),
+                basin_overrides=self._cpu_safe_basin_overrides(),
             )
             self.assertEqual(result.summary["placement_mode"], "anchor_free")
             self.assertGreater(result.summary["n_basis_primitives"], 0)
@@ -36,6 +42,7 @@ class TestWorkflowAPI(unittest.TestCase):
                 work_dir=Path(td) / "anchoraware",
                 placement_mode="anchor_aware",
                 schedule=SamplingSchedule(name="smoke", exhaustive_pose_sampling=False),
+                basin_overrides=self._cpu_safe_basin_overrides(),
             )
             self.assertEqual(result.summary["placement_mode"], "anchor_aware")
             self.assertGreaterEqual(result.summary["n_basins"], 1)
@@ -55,6 +62,7 @@ class TestWorkflowAPI(unittest.TestCase):
                     pre_relax_selection=StageSelectionConfig(enabled=True, strategy="fps", max_candidates=4, random_seed=0),
                     post_relax_selection=StageSelectionConfig(enabled=True, strategy="hierarchical", cluster_threshold=0.05),
                 ),
+                basin_overrides=self._cpu_safe_basin_overrides(),
             )
             self.assertLessEqual(result.summary["n_pose_frames_selected_for_basin"], result.summary["n_pose_frames"])
             self.assertEqual(result.workflow.summary["pre_relax_selection"]["strategy"], "fps")
@@ -88,11 +96,30 @@ class TestWorkflowAPI(unittest.TestCase):
                     ),
                     post_relax_selection=StageSelectionConfig(enabled=False, strategy="none"),
                 ),
+                basin_overrides=self._cpu_safe_basin_overrides(),
             )
             diag = result.workflow.summary["pre_relax_selection"]
             self.assertEqual(diag["strategy"], "iterative_fps")
             self.assertLessEqual(result.summary["n_pose_frames_selected_for_basin"], 8)
             self.assertTrue((Path(td) / "iterative" / "pre_relax_selection_rounds").exists())
+
+    def test_generate_adsorption_ensemble_accepts_node_overrides(self):
+        slab = fcc111("Pt", size=(3, 3, 4), vacuum=12.0)
+        ads = molecule("CO")
+        with TemporaryDirectory() as td:
+            result = generate_adsorption_ensemble(
+                slab=slab,
+                adsorbate=ads,
+                work_dir=Path(td) / "surface_geometry",
+                placement_mode="anchor_free",
+                schedule=SamplingSchedule(name="smoke", exhaustive_pose_sampling=False),
+                basin_overrides=self._cpu_safe_basin_overrides(),
+                node_overrides={"node_identity_mode": "surface_geometry"},
+            )
+            self.assertEqual(result.summary["node_overrides"]["node_identity_mode"], "surface_geometry")
+            nodes = json.loads(Path(result.files["nodes_json"]).read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(nodes), 1)
+            self.assertIn("surface_geometry_key", nodes[0])
 
 
 if __name__ == "__main__":

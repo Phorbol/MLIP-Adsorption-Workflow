@@ -49,10 +49,12 @@ class FlexSamplingBudget:
     md_time_ps: float
     md_runs: int
     preselect_k: int
+    target_final_k: int
+    selection_profile: str
     fps_rounds: int
     fps_round_size: int
     score: float
-    rationale: dict[str, float | int | bool]
+    rationale: dict[str, float | int | bool | str]
 
 
 def plan_flex_sampling_budget(
@@ -99,6 +101,8 @@ def plan_flex_sampling_budget(
             md_time_ps=0.0,
             md_runs=0,
             preselect_k=0,
+            target_final_k=0,
+            selection_profile="disabled",
             fps_rounds=0,
             fps_round_size=0,
             score=float(score),
@@ -111,11 +115,14 @@ def plan_flex_sampling_budget(
                 "surface_complexity": float(surf_complexity),
                 "score": float(score),
                 "run_conformer_search": False,
+                "target_final_k": 0,
+                "selection_profile": "disabled",
             },
         )
     md_time_ps = float(min(40.0, max(8.0, 8.0 + 2.2 * score)))
     md_runs = int(min(6, max(2, round(2 + score / 2.2))))
     preselect_k = int(min(256, max(64, round(64 + 18 * score))))
+    target_final_k = int(12 if score >= 5.0 else 8)
     fps_rounds = int(min(16, max(4, round(4 + score / 1.4))))
     fps_round_size = int(min(48, max(12, round(12 + 4 * score))))
     return FlexSamplingBudget(
@@ -123,6 +130,8 @@ def plan_flex_sampling_budget(
         md_time_ps=md_time_ps,
         md_runs=md_runs,
         preselect_k=preselect_k,
+        target_final_k=target_final_k,
+        selection_profile="adsorption_seed_broad",
         fps_rounds=fps_rounds,
         fps_round_size=fps_round_size,
         score=float(score),
@@ -138,8 +147,9 @@ def plan_flex_sampling_budget(
             "md_time_ps": float(md_time_ps),
             "md_runs": int(md_runs),
             "preselect_k": int(preselect_k),
+            "target_final_k": int(target_final_k),
+            "selection_profile": "adsorption_seed_broad",
             "fps_rounds": int(fps_rounds),
             "fps_round_size": int(fps_round_size),
         },
     )
-

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -8,16 +10,18 @@ from typing import Protocol
 import numpy as np
 from ase import Atoms
 from ase.io import write
+from adsorption_ensemble.selection.strategies import RMSDSelector
 
 from .config import ConformerMDSamplerConfig
 from .descriptors import DescriptorExtractor, GeometryPairDistanceDescriptor, MACEInvariantDescriptor
 from .mace_inference import MACEBatchInferencer
+from .rdkit_generator import RDKitConformerGenerator
 from .selectors import ConformerSelector
 from .xtb import MDRunResult, XTBMDRunner
 
 
-class MDRunner(Protocol):
-    def run(self, molecule: Atoms, run_dir: Path) -> MDRunResult:
+class ConformerGenerator(Protocol):
+    def generate(self, molecule: Atoms, run_dir: Path) -> MDRunResult:
         ...
 
 
@@ -149,12 +153,12 @@ class ConformerMDSampler:
     def __init__(
         self,
         config: ConformerMDSamplerConfig,
-        md_runner: MDRunner | None = None,
+        md_runner: object | None = None,
         descriptor_extractor: DescriptorExtractor | None = None,
         relax_backend: RelaxBackend | None = None,
     ):
         self.config = config
-        self.md_runner = md_runner or XTBMDRunner(config.md)
+        self.conformer_generator = md_runner or self._build_conformer_generator(config)
         if descriptor_extractor is None:
             self.descriptor_extractor = self._build_descriptor_extractor(config)
         else:
@@ -166,18 +170,18 @@ class ConformerMDSampler:
         self.selector = ConformerSelector(config.selection)
 
     def run(self, molecule: Atoms, job_name: str = "conformer_job") -> ConformerEnsemble:
-        all_frames: list[Atoms] = []
-        run_metadata: list[dict] = []
         run_dir = self.config.output.work_dir / job_name
         run_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(max(1, self.config.md.n_runs)):
-            child = run_dir / f"md_run_{i:03d}"
-            result = self.md_runner.run(molecule, child)
-            all_frames.extend(result.frames)
-            run_metadata.append(dict(result.metadata))
+        all_frames, run_metadata, generator_summary = self._generate_raw_frames(molecule=molecule, run_dir=run_dir)
         if not all_frames:
-            raise RuntimeError("No MD frames were produced.")
-        return self.run_from_frames(frames=all_frames, job_name=job_name, md_runs_metadata=run_metadata, raw_features=None)
+            raise RuntimeError("No conformer frames were produced.")
+        return self.run_from_frames(
+            frames=all_frames,
+            job_name=job_name,
+            md_runs_metadata=run_metadata,
+            raw_features=None,
+            generator_summary=generator_summary,
+        )
 
     def run_from_frames(
         self,
@@ -185,6 +189,7 @@ class ConformerMDSampler:
         job_name: str,
         md_runs_metadata: list[dict] | None = None,
         raw_features: np.ndarray | None = None,
+        generator_summary: dict | None = None,
     ) -> ConformerEnsemble:
         run_dir = self.config.output.work_dir / job_name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -193,19 +198,21 @@ class ConformerMDSampler:
             raise RuntimeError("No frames were provided.")
         if raw_features is None:
             raw_features = self.descriptor_extractor.transform(all_frames)
-        pre_ids = self.selector._preselect(energies=np.zeros(len(all_frames), dtype=float), features=np.asarray(raw_features, dtype=float))
+        raw_energies = self._resolve_raw_energies(all_frames)
+        pre_ids = self.selector._preselect(energies=raw_energies, features=np.asarray(raw_features, dtype=float))
         pre_frames = [all_frames[i] for i in pre_ids]
-        geom_desc = GeometryPairDistanceDescriptor(use_float64=self.config.descriptor.use_float64)
-        pre_features = geom_desc.transform(pre_frames)
+        metric_extractor = self._build_metric_extractor(self.config)
+        pre_features = metric_extractor.transform(pre_frames)
         loose_frames, loose_energies = self.relax_backend.relax_batch(
             pre_frames,
             run_dir / "relax_loose",
             maxf=self.config.relax.loose.maxf,
             steps=self.config.relax.loose.steps,
         )
+        loose_energies = self._apply_energy_semantics(loose_energies, loose_frames)
         if len(loose_frames) != len(pre_ids) or len(loose_energies) != len(pre_ids):
             raise ValueError("Loose relax backend output shape mismatch.")
-        loose_features = geom_desc.transform(loose_frames)
+        loose_features = metric_extractor.transform(loose_frames)
         loose_keep_ids = self._apply_filter(
             energies=np.asarray(loose_energies, dtype=float),
             features=np.asarray(loose_features, dtype=float),
@@ -223,15 +230,21 @@ class ConformerMDSampler:
             maxf=self.config.relax.refine.maxf,
             steps=self.config.relax.refine.steps,
         )
+        refine_energies = self._apply_energy_semantics(refine_energies, refine_frames)
         if len(refine_frames) != len(refine_input) or len(refine_energies) != len(refine_input):
             raise ValueError("Refine relax backend output shape mismatch.")
-        refine_features = geom_desc.transform(refine_frames)
+        refine_features = metric_extractor.transform(refine_frames)
         final_ids = self._apply_filter(
             energies=np.asarray(refine_energies, dtype=float),
             features=np.asarray(refine_features, dtype=float),
             energy_window_ev=self.config.selection.final_energy_window_ev,
             rmsd_threshold=self.config.selection.final_rmsd_threshold,
             strategy=self.config.selection.final_filter,
+        )
+        final_ids = self._apply_target_final_k(
+            candidate_ids=final_ids,
+            energies=np.asarray(refine_energies, dtype=float),
+            features=np.asarray(refine_features, dtype=float),
         )
         selected_relaxed = [refine_frames[i] for i in final_ids]
         selected_energies = np.asarray([refine_energies[i] for i in final_ids], dtype=float)
@@ -257,7 +270,22 @@ class ConformerMDSampler:
         metadata = {
             "job_name": job_name,
             "config": asdict(self.config),
-            "md_runs": md_runs_metadata or [],
+            "generator_backend": str(self._generator_backend(self.config)),
+            "generator_summary": dict(generator_summary or {}),
+            "generator_runs": [dict(x) for x in (md_runs_metadata or [])],
+            "selection_profile": str(self.config.selection.selection_profile),
+            "resolved_preselect_k": int(self.config.selection.preselect_k),
+            "resolved_target_final_k": (
+                None if self.config.selection.target_final_k is None else int(self.config.selection.target_final_k)
+            ),
+            "resolved_metric_backend": str(self._resolve_metric_backend(self.config)),
+            "resolved_structure_metric_threshold": float(self.config.selection.rmsd_threshold),
+            "resolved_energy_window_ev": float(self.config.selection.energy_window_ev),
+            "resolved_pair_energy_gap_ev": float(self.config.selection.pair_energy_gap_ev),
+            "energy_semantics": str(self._energy_semantics_label()),
+            "use_total_energy": bool(self.config.selection.use_total_energy),
+            "md_runs": ([dict(x) for x in (md_runs_metadata or [])] if self._generator_backend(self.config) == "xtb_md" else []),
+            "per_run_seeds": [int(m["seed"]) for m in (md_runs_metadata or []) if "seed" in m],
             "n_raw_frames": len(all_frames),
             "n_preselected": len(pre_ids),
             "n_after_loose_filter": len(loose_keep_ids),
@@ -265,6 +293,7 @@ class ConformerMDSampler:
             "n_selected": len(final_ids),
             "preselected_ids_in_raw": pre_ids,
             "selected_ids_in_refine": final_ids,
+            "raw_energy_source": str(self._raw_energy_source(all_frames)),
             "result_summary": result_summary,
             "stage_metrics": stage_metrics,
         }
@@ -315,12 +344,24 @@ class ConformerMDSampler:
             return sorted(kept, key=lambda i: float(energies[i]))
         if strat == "rmsd":
             ordered = sorted(cand, key=lambda i: float(energies[i]))
-            return RMSDSelector(threshold=float(rmsd_threshold)).select(features=features, candidate_ids=ordered)
+            return self._select_by_metric_threshold_with_pair_gap(
+                energies=energies,
+                features=features,
+                candidate_ids=ordered,
+                metric_threshold=float(rmsd_threshold),
+            )
         dual = DualThresholdSelector(
             energy_window=EnergyWindowFilter(delta_e=float(energy_window_ev)),
             rmsd_selector=RMSDSelector(threshold=float(rmsd_threshold)),
         )
-        return dual.select(energies=energies, features=features, candidate_ids=cand)
+        kept = dual.energy_window.select(energies=energies, candidate_ids=cand)
+        ordered = sorted(kept, key=lambda i: float(energies[i]))
+        return self._select_by_metric_threshold_with_pair_gap(
+            energies=energies,
+            features=features,
+            candidate_ids=ordered,
+            metric_threshold=float(rmsd_threshold),
+        )
 
     def _write_outputs(
         self,
@@ -334,6 +375,8 @@ class ConformerMDSampler:
         selected_energies: np.ndarray,
         metadata: dict,
     ) -> None:
+        if all_frames:
+            write((run_dir / "raw_generated.extxyz").as_posix(), all_frames)
         if self.config.output.save_all_frames:
             write((run_dir / "all_frames.extxyz").as_posix(), all_frames)
         if pre_frames:
@@ -368,6 +411,37 @@ class ConformerMDSampler:
         raise ValueError(f"Unsupported descriptor backend: {config.descriptor.backend}")
 
     @staticmethod
+    def _build_metric_extractor(config: ConformerMDSamplerConfig) -> DescriptorExtractor:
+        backend = ConformerMDSampler._resolve_metric_backend(config)
+        if backend == "geometry":
+            return GeometryPairDistanceDescriptor(use_float64=config.descriptor.use_float64)
+        if backend == "mace":
+            mace_cfg = copy.deepcopy(config.descriptor.mace)
+            infer = MACEBatchInferencer(mace_cfg)
+            return MACEInvariantDescriptor(inferencer=infer)
+        raise ValueError(f"Unsupported conformer metric backend: {config.selection.metric_backend}")
+
+    @staticmethod
+    def _resolve_metric_backend(config: ConformerMDSamplerConfig) -> str:
+        backend = str(config.selection.metric_backend).strip().lower()
+        if backend in {"", "auto"}:
+            backend = config.descriptor.backend.lower()
+        return backend
+
+    @staticmethod
+    def _generator_backend(config: ConformerMDSamplerConfig) -> str:
+        return str(config.generator.backend).strip().lower()
+
+    @staticmethod
+    def _build_conformer_generator(config: ConformerMDSamplerConfig):
+        backend = ConformerMDSampler._generator_backend(config)
+        if backend == "xtb_md":
+            return XTBMDRunner(config.generator.xtb)
+        if backend == "rdkit_embed":
+            return RDKitConformerGenerator(config.generator.rdkit)
+        raise ValueError(f"Unsupported conformer generator backend: {config.generator.backend}")
+
+    @staticmethod
     def _build_relax_backend(config: ConformerMDSamplerConfig) -> RelaxBackend:
         backend = config.relax.backend.lower()
         if backend == "identity":
@@ -379,6 +453,148 @@ class ConformerMDSampler:
             infer = MACEBatchInferencer(config.relax.mace)
             return MACERelaxBackend(inferencer=infer)
         raise ValueError(f"Unsupported relax backend: {config.relax.backend}")
+
+    def _apply_md_run_seed(self, run_index: int) -> None:
+        mode = str(getattr(self.config.md, "seed_mode", "increment_per_run")).strip().lower()
+        seed0 = int(self.config.md.seed)
+        if mode == "fixed":
+            seed_use = seed0
+        elif mode == "increment_per_run":
+            seed_use = seed0 + int(run_index)
+        elif mode == "hashed":
+            seed_use = abs(hash((seed0, int(run_index)))) % (2**31 - 1)
+        else:
+            raise ValueError(f"Unsupported MD seed mode: {self.config.md.seed_mode}")
+        if hasattr(self.conformer_generator, "config"):
+            try:
+                self.conformer_generator.config.seed = int(seed_use)
+            except Exception:
+                pass
+
+    def _generate_once(self, molecule: Atoms, run_dir: Path) -> MDRunResult:
+        if hasattr(self.conformer_generator, "generate"):
+            return self.conformer_generator.generate(molecule, run_dir)
+        if hasattr(self.conformer_generator, "run"):
+            return self.conformer_generator.run(molecule, run_dir)
+        raise TypeError("Conformer generator must expose generate(...) or run(...).")
+
+    def _generate_raw_frames(self, molecule: Atoms, run_dir: Path) -> tuple[list[Atoms], list[dict], dict]:
+        backend = self._generator_backend(self.config)
+        all_frames: list[Atoms] = []
+        run_metadata: list[dict] = []
+        t0 = time.perf_counter()
+        if backend == "xtb_md":
+            for i in range(max(1, self.config.md.n_runs)):
+                child = run_dir / f"md_run_{i:03d}"
+                self._apply_md_run_seed(run_index=i)
+                result = self._generate_once(molecule, child)
+                all_frames.extend(result.frames)
+                run_metadata.append(dict(result.metadata))
+            summary = {
+                "generator_backend": "xtb_md",
+                "n_runs": int(len(run_metadata)),
+                "n_raw_frames": int(len(all_frames)),
+                "walltime_generation_s": float(time.perf_counter() - t0),
+            }
+            return all_frames, run_metadata, summary
+        if backend == "rdkit_embed":
+            child = run_dir / "rdkit_embed"
+            result = self._generate_once(molecule, child)
+            all_frames = [a.copy() for a in result.frames]
+            run_metadata = [dict(result.metadata)]
+            summary = dict(result.metadata)
+            summary["n_raw_frames"] = int(len(all_frames))
+            summary["walltime_generation_s"] = float(time.perf_counter() - t0)
+            return all_frames, run_metadata, summary
+        raise ValueError(f"Unsupported conformer generator backend: {self.config.generator.backend}")
+
+    def _resolve_raw_energies(self, frames: list[Atoms]) -> np.ndarray:
+        supplied = getattr(self.descriptor_extractor, "last_energies_ev", None)
+        if supplied is not None:
+            arr = np.asarray(supplied, dtype=float)
+            if len(arr) == len(frames):
+                return self._apply_energy_semantics(arr, frames)
+        frame_info_vals = [a.info.get("generator_energy_ev", None) for a in frames]
+        if frame_info_vals and all(v is not None for v in frame_info_vals):
+            try:
+                return self._apply_energy_semantics(np.asarray(frame_info_vals, dtype=float), frames)
+            except Exception:
+                pass
+        return self._apply_energy_semantics(np.zeros(len(frames), dtype=float), frames)
+
+    def _raw_energy_source(self, frames: list[Atoms] | None = None) -> str:
+        supplied = getattr(self.descriptor_extractor, "last_energies_ev", None)
+        if supplied is not None:
+            return "descriptor"
+        if frames is not None:
+            vals = [a.info.get("generator_energy_ev", None) for a in frames]
+            if vals and all(v is not None for v in vals):
+                return "frame_info"
+        return "zeros"
+
+    def _apply_energy_semantics(self, energies: np.ndarray, frames: list[Atoms]) -> np.ndarray:
+        arr = np.asarray(energies, dtype=float)
+        if not bool(self.config.selection.use_total_energy):
+            return arr
+        if len(arr) != len(frames):
+            return arr
+        counts = np.asarray([len(a) for a in frames], dtype=float)
+        return arr * counts
+
+    def _energy_semantics_label(self) -> str:
+        return "total_ev" if bool(self.config.selection.use_total_energy) else "per_atom_ev"
+
+    def _apply_target_final_k(self, candidate_ids: list[int], energies: np.ndarray, features: np.ndarray) -> list[int]:
+        k = self.config.selection.target_final_k
+        if k is None or int(k) <= 0 or len(candidate_ids) <= int(k):
+            return sorted(candidate_ids, key=lambda i: float(energies[i]))
+        ordered = sorted(candidate_ids, key=lambda i: float(energies[i]))
+        if features.ndim != 2 or features.shape[0] == 0:
+            return ordered[: int(k)]
+        selected = [ordered[0]]
+        remaining = ordered[1:]
+        while remaining and len(selected) < int(k):
+            best_id = remaining[0]
+            best_score = None
+            for idx in remaining:
+                ref = features[selected]
+                diff = ref - features[idx]
+                min_dist = float(np.min(np.sqrt(np.sum(diff * diff, axis=1))))
+                pair_gap = min(abs(float(energies[idx]) - float(energies[j])) for j in selected)
+                score = (min_dist, pair_gap, -float(energies[idx]))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_id = idx
+            selected.append(best_id)
+            remaining = [idx for idx in remaining if idx != best_id]
+        return selected
+
+    def _select_by_metric_threshold_with_pair_gap(
+        self,
+        energies: np.ndarray,
+        features: np.ndarray,
+        candidate_ids: list[int],
+        metric_threshold: float,
+    ) -> list[int]:
+        pair_gap = float(self.config.selection.pair_energy_gap_ev)
+        if pair_gap <= 0.0:
+            return RMSDSelector(threshold=float(metric_threshold)).select(features=features, candidate_ids=candidate_ids)
+        selected: list[int] = []
+        for idx in candidate_ids:
+            if not selected:
+                selected.append(int(idx))
+                continue
+            ref = features[selected]
+            diff = ref - features[idx]
+            dists = np.sqrt(np.sum(diff * diff, axis=1))
+            close_mask = dists < float(metric_threshold)
+            if not np.any(close_mask):
+                selected.append(int(idx))
+                continue
+            close_selected = [selected[pos] for pos, flag in enumerate(close_mask.tolist()) if bool(flag)]
+            if all(abs(float(energies[idx]) - float(energies[j])) >= pair_gap for j in close_selected):
+                selected.append(int(idx))
+        return selected
 
     @staticmethod
     def _build_result_summary(selected_energies: np.ndarray) -> dict:
@@ -407,6 +623,10 @@ class ConformerMDSampler:
         summary = metadata.get("result_summary", {})
         lines = [
             f"job_name: {metadata.get('job_name', '')}",
+            f"generator_backend: {metadata.get('generator_backend', '')}",
+            f"selection_profile: {metadata.get('selection_profile', '')}",
+            f"energy_semantics: {metadata.get('energy_semantics', '')}",
+            f"target_final_k: {metadata.get('resolved_target_final_k')}",
             f"n_raw_frames: {metadata.get('n_raw_frames', 0)}",
             f"n_preselected: {metadata.get('n_preselected', 0)}",
             f"n_selected: {metadata.get('n_selected', 0)}",

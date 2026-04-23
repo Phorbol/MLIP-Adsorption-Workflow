@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+import os
 
 import numpy as np
 from ase import Atoms
@@ -33,6 +34,8 @@ class MACEBatchInferencer:
     def __init__(self, config: MACEInferenceConfig):
         self.config = config
         self._model = None
+        self._runtime_device = None
+        self._runtime_meta = None
 
     def infer(self, frames: list[Atoms]) -> MACEBatchResult:
         if not frames:
@@ -51,8 +54,10 @@ class MACEBatchInferencer:
                 },
             )
         torch, extract_invariant, scatter_mean, has_scatter, tg, utils, data_mod, o3 = self._load_dependencies()
-        model = self._get_model(torch)
+        runtime_device, runtime_meta = self._resolve_runtime_device(torch)
+        model = self._get_model(torch, runtime_device=runtime_device)
         num_layers, num_inv_feats, l_max, feat_dim = self._resolve_feature_dims(model, o3)
+        available_heads = self._discover_available_heads(model)
         head_name_use = self._resolve_head_name(model)
         batches_data, batches_img, build_stats = self._create_batches_parallel(
             frames=frames,
@@ -71,7 +76,7 @@ class MACEBatchInferencer:
             edge_counts_per_batch.append(int(np.sum([d.edge_index.shape[1] for d in bd])))
             natoms = [len(a) for a in bi]
             loader = tg.dataloader.DataLoader(dataset=bd, batch_size=len(bd), shuffle=False)
-            batch = next(iter(loader)).to(self.config.device)
+            batch = next(iter(loader)).to(runtime_device)
             batch_dict = batch.to_dict()
             tdtype = torch.float64 if self.config.dtype == "float64" else torch.float32
             for k, v in list(batch_dict.items()):
@@ -104,11 +109,17 @@ class MACEBatchInferencer:
         metadata = {
             "model_path": self.config.model_path,
             "device": self.config.device,
+            "requested_device": self.config.device,
+            "runtime_device": runtime_meta["device"],
+            "runtime_rank": runtime_meta["rank"],
+            "runtime_world_size": runtime_meta["world_size"],
+            "runtime_local_rank": runtime_meta["local_rank"],
             "dtype": self.config.dtype,
             "enable_cueq": bool(self.config.enable_cueq),
             "max_edges_per_batch": self.config.max_edges_per_batch,
             "layers_to_keep": self.config.layers_to_keep,
             "head_name": head_name_use,
+            "available_heads": available_heads,
             "n_input_frames": len(frames),
             "n_batches": len(batches_data),
             "n_output_frames": len(all_epa),
@@ -136,8 +147,10 @@ class MACEBatchInferencer:
                 "failed_indices": [],
             }
         torch, extract_invariant, _, _, tg, utils, data_mod, o3 = self._load_dependencies()
-        model = self._get_model(torch)
+        runtime_device, runtime_meta = self._resolve_runtime_device(torch)
+        model = self._get_model(torch, runtime_device=runtime_device)
         num_layers, num_inv_feats, l_max, feat_dim = self._resolve_feature_dims(model, o3)
+        available_heads = self._discover_available_heads(model)
         head_name_use = self._resolve_head_name(model)
         batches_data, batches_img, batches_idx, build_stats = self._create_batches_parallel_aligned(
             frames=frames,
@@ -155,7 +168,7 @@ class MACEBatchInferencer:
             edge_counts_per_batch.append(int(np.sum([d.edge_index.shape[1] for d in bd])))
             natoms = [len(a) for a in bi]
             loader = tg.dataloader.DataLoader(dataset=bd, batch_size=len(bd), shuffle=False)
-            batch = next(iter(loader)).to(self.config.device)
+            batch = next(iter(loader)).to(runtime_device)
             batch_dict = batch.to_dict()
             tdtype = torch.float64 if self.config.dtype == "float64" else torch.float32
             for k, v in list(batch_dict.items()):
@@ -183,11 +196,17 @@ class MACEBatchInferencer:
         metadata = {
             "model_path": self.config.model_path,
             "device": self.config.device,
+            "requested_device": self.config.device,
+            "runtime_device": runtime_meta["device"],
+            "runtime_rank": runtime_meta["rank"],
+            "runtime_world_size": runtime_meta["world_size"],
+            "runtime_local_rank": runtime_meta["local_rank"],
             "dtype": self.config.dtype,
             "enable_cueq": bool(self.config.enable_cueq),
             "max_edges_per_batch": self.config.max_edges_per_batch,
             "layers_to_keep": self.config.layers_to_keep,
             "head_name": head_name_use,
+            "available_heads": available_heads,
             "n_input_frames": len(frames),
             "n_batches": len(batches_data),
             "n_config_ok": build_stats["n_config_ok"],
@@ -200,21 +219,47 @@ class MACEBatchInferencer:
         }
         return node_desc, epa, metadata
 
-    def _get_model(self, torch):
+    def _resolve_runtime_device(self, torch) -> tuple[str, dict]:
+        preferred_device = str(self.config.device)
+        rank = int(os.environ.get("SLURM_PROCID", 0))
+        world_size = int(os.environ.get("SLURM_NTASKS", 1))
+        local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+        if "LOCAL_RANK" in os.environ:
+            local_rank = int(os.environ["LOCAL_RANK"])
+            rank = int(os.environ.get("RANK", rank))
+            world_size = int(os.environ.get("WORLD_SIZE", world_size))
+        runtime_device = preferred_device
+        if preferred_device.lower().startswith("cuda"):
+            if not bool(torch.cuda.is_available()):
+                runtime_device = "cpu"
+            elif preferred_device == "cuda":
+                runtime_device = f"cuda:{local_rank}"
+        meta = {
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "local_rank": int(local_rank),
+            "device": str(runtime_device),
+        }
+        self._runtime_device = str(runtime_device)
+        self._runtime_meta = dict(meta)
+        return str(runtime_device), meta
+
+    def _get_model(self, torch, runtime_device: str | None = None):
         if self._model is not None:
             return self._model
         if not self.config.model_path:
             raise ValueError("MACE model_path is required for mace backend.")
-        model = torch.load(self.config.model_path, map_location=self.config.device)
+        runtime_device_use = str(runtime_device or self._runtime_device or self.config.device)
+        model = torch.load(self.config.model_path, map_location=runtime_device_use)
         model = model.float() if self.config.dtype == "float32" else model.double()
-        model = model.to(self.config.device)
-        if bool(self.config.enable_cueq) and str(self.config.device).lower().startswith("cuda"):
+        model = model.to(runtime_device_use)
+        if bool(self.config.enable_cueq) and runtime_device_use.lower().startswith("cuda"):
             try:
                 from mace.calculators.mace import run_e3nn_to_cueq
             except Exception as exc:
                 raise RuntimeError("enable_cueq=True but CuEq conversion is unavailable for MACE inference.") from exc
-            model = run_e3nn_to_cueq(model, device=self.config.device).to(self.config.device)
-        if str(self.config.device).lower().startswith("cuda"):
+            model = run_e3nn_to_cueq(model, device=runtime_device_use).to(runtime_device_use)
+        if runtime_device_use.lower().startswith("cuda"):
             model._enable_amp = False
         for param in model.parameters():
             param.requires_grad = False
@@ -343,27 +388,51 @@ class MACEBatchInferencer:
         return batches_data, batches_img, batches_idx, stats
 
     @staticmethod
-    def _resolve_head_name(model) -> str:
-        head = str(getattr(model, "head_name", "")).strip()
-        if head:
-            return head
-        cfg = str(getattr(getattr(model, "config", None), "head_name", "")).strip()
-        if cfg:
-            return cfg
-        heads = getattr(model, "heads", None)
-        if isinstance(heads, dict) and heads:
-            k0 = next(iter(heads.keys()))
-            if isinstance(k0, str) and str(k0).strip():
-                return str(k0).strip()
-        if isinstance(heads, (list, tuple)) and heads:
-            k0 = heads[0]
-            if isinstance(k0, str) and str(k0).strip():
-                return str(k0).strip()
+    def _normalize_head_name(value) -> str:
+        return str(value).strip() if value is not None else ""
+
+    @classmethod
+    def _discover_available_heads(cls, model) -> list[str]:
+        found: list[str] = []
+
+        def add(value) -> None:
+            name = cls._normalize_head_name(value)
+            if name and name not in found:
+                found.append(name)
+
+        available_heads = getattr(model, "available_heads", None)
+        if isinstance(available_heads, (list, tuple)):
+            for item in available_heads:
+                add(item)
+
         head_names = getattr(model, "head_names", None)
-        if isinstance(head_names, (list, tuple)) and head_names:
-            k0 = head_names[0]
-            if isinstance(k0, str) and str(k0).strip():
-                return str(k0).strip()
+        if isinstance(head_names, (list, tuple)):
+            for item in head_names:
+                add(item)
+
+        heads = getattr(model, "heads", None)
+        if isinstance(heads, dict):
+            for item in heads.keys():
+                add(item)
+        elif isinstance(heads, (list, tuple)):
+            for item in heads:
+                add(item)
+
+        add(getattr(model, "head_name", None))
+        add(getattr(getattr(model, "config", None), "head_name", None))
+        return found
+
+    def _resolve_head_name(self, model) -> str:
+        preferred = self._normalize_head_name(self.config.head_name)
+        available_heads = self._discover_available_heads(model)
+        if preferred and preferred != "Default":
+            if available_heads and preferred not in available_heads:
+                raise ValueError(
+                    f"Requested head '{preferred}' is not available in model heads {available_heads}."
+                )
+            return preferred
+        if available_heads:
+            return str(available_heads[0])
         return "Default"
 
     @staticmethod

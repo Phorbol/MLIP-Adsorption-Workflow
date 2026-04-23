@@ -9,6 +9,7 @@ from ase.geometry.geometry import general_find_mic
 
 from adsorption_ensemble.pose import PoseSampler, PoseSamplerConfig
 from adsorption_ensemble.site import PrimitiveBuilder
+from adsorption_ensemble.site.embedding import PrimitiveEmbedder, PrimitiveEmbeddingConfig
 from adsorption_ensemble.surface import SurfacePreprocessor
 
 
@@ -23,6 +24,33 @@ class TestPoseSampler(unittest.TestCase):
         primitives = self.builder.build(slab, ctx)
         ads = molecule("CO")
         return slab, ads, ctx.detection.surface_atom_ids, primitives
+
+    def _prepare_planar_basis_inputs(self):
+        slab = fcc111("Pd", size=(3, 3, 4), vacuum=20.0)
+        ctx = self.pre.build_context(slab)
+        raw_primitives = self.builder.build(slab, ctx)
+        embed = PrimitiveEmbedder(PrimitiveEmbeddingConfig(l2_distance_threshold=0.20)).fit_transform(
+            slab=slab,
+            primitives=list(raw_primitives),
+            atom_features=np.asarray(slab.get_atomic_numbers(), dtype=float).reshape(-1, 1),
+        )
+        ads = molecule("C6H6")
+        return slab, ads, ctx.detection.surface_atom_ids, list(embed.basis_primitives)
+
+    @staticmethod
+    def _ring_plane_angle_deg(adsorbate):
+        pos = np.asarray(adsorbate.get_positions(), dtype=float)
+        z = np.asarray(adsorbate.get_atomic_numbers(), dtype=int)
+        carbon_idx = [i for i, zi in enumerate(z) if int(zi) == 6]
+        carbon_pos = pos[carbon_idx]
+        center = np.mean(carbon_pos, axis=0, keepdims=True)
+        centered = carbon_pos - center
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        plane_normal = np.asarray(vh[-1], dtype=float)
+        plane_normal = plane_normal / (np.linalg.norm(plane_normal) + 1e-12)
+        c = abs(float(np.dot(plane_normal, np.array([0.0, 0.0, 1.0], dtype=float))))
+        c = min(1.0, max(-1.0, c))
+        return float(np.degrees(np.arccos(c)))
 
     @staticmethod
     def _min_scaled_distance(slab, adsorbate, surface_atom_ids):
@@ -210,6 +238,41 @@ class TestPoseSampler(unittest.TestCase):
         self.assertEqual(len(quats), 4)
         self.assertGreaterEqual(max(tilts), 45.0)
         self.assertGreaterEqual(sum(1 for t in tilts if t >= 30.0), 2)
+
+    def test_planar_like_detection_targets_benzene_but_not_nh3(self):
+        sampler = PoseSampler(PoseSamplerConfig())
+        self.assertTrue(bool(sampler._is_planar_like_nonlinear(molecule("C6H6"))))
+        self.assertFalse(bool(sampler._is_planar_like_nonlinear(molecule("NH3"))))
+
+    def test_planar_nonlinear_sampling_preserves_flat_tilt_upright_families_under_production_budget(self):
+        slab, ads, surface_ids, primitives = self._prepare_planar_basis_inputs()
+        cfg = PoseSamplerConfig(
+            placement_mode="anchor_free",
+            n_rotations=4,
+            n_azimuth=8,
+            n_shifts=2,
+            shift_radius=0.15,
+            min_height=1.2,
+            max_height=3.4,
+            height_step=0.10,
+            max_poses_per_site=4,
+            random_seed=0,
+            adaptive_height_fallback=True,
+            adaptive_height_fallback_step=0.20,
+            adaptive_height_fallback_max_extra=1.60,
+            adaptive_height_fallback_contact_slack=0.60,
+        )
+        out = PoseSampler(cfg).sample(
+            slab=slab,
+            adsorbate=ads,
+            primitives=primitives,
+            surface_atom_ids=surface_ids,
+        )
+        self.assertGreater(len(out), 0)
+        angles = [self._ring_plane_angle_deg(p.atoms) for p in out]
+        self.assertTrue(any(a < 20.0 for a in angles), msg=f"Missing flat family: {angles}")
+        self.assertTrue(any(20.0 <= a < 70.0 for a in angles), msg=f"Missing tilted family: {angles}")
+        self.assertTrue(any(a >= 70.0 for a in angles), msg=f"Missing upright family: {angles}")
 
     def test_pose_sampler_adaptive_height_fallback_recovers_clashing_candidate_even_when_some_exist(self):
         slab, ads, surface_ids, primitives = self._prepare_inputs()
@@ -463,6 +526,50 @@ class TestPoseSampler(unittest.TestCase):
             lowest_idx = int(np.argmin(np.asarray(rotated.positions, dtype=float)[:, 2]))
             lowest_symbols.append(str(ads[lowest_idx].symbol))
         self.assertIn("O", lowest_symbols)
+
+    def test_nonlinear_quaternion_schedule_keeps_backbone_coverage_when_atom_down_budget_is_full(self):
+        ads = Atoms(
+            "C5",
+            positions=np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [-1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.2],
+                    [0.0, -1.0, -0.3],
+                    [0.2, 0.1, 1.1],
+                ],
+                dtype=float,
+            ),
+        )
+        ads.positions = ads.positions - ads.get_center_of_mass()
+        sampler = PoseSampler(PoseSamplerConfig(n_rotations=4, nonlinear_atom_down_coverage=True))
+        atom_down = sampler._nonlinear_atom_down_quaternions(
+            adsorbate_centered=ads,
+            max_vectors=4,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+        )
+        self.assertEqual(len(atom_down), 4)
+        quats = sampler._build_site_oriented_quaternions(
+            adsorbate_centered=ads,
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            mol_class="nonlinear",
+            rng=np.random.default_rng(0),
+            n_rot=4,
+        )
+        self.assertEqual(len(quats), 4)
+        self.assertTrue(
+            any(
+                all(float(sampler._quaternion_distance(quat, ref)) > 1e-8 for ref in atom_down)
+                for quat in quats
+            ),
+            msg="Nonlinear coverage collapsed to atom-down quaternions only; no backbone orientation survived.",
+        )
+
+    def test_tangent_shift_schedule_is_rng_invariant(self):
+        s1 = PoseSampler._sample_tangent_shifts(np.random.default_rng(0), 4, 0.35)
+        s2 = PoseSampler._sample_tangent_shifts(np.random.default_rng(123), 4, 0.35)
+        self.assertEqual(len(s1), len(s2))
+        self.assertTrue(all(np.allclose(a, b, atol=1e-12) for a, b in zip(s1, s2, strict=False)))
 
     def test_select_adsorption_origin_prefers_carbon_end_for_co(self):
         ads = molecule("CO")

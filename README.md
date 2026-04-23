@@ -26,6 +26,8 @@
 - [Current Default Workflow](#current-default-workflow)
 - [Experimental Final Merge](#experimental-final-merge)
 - [Visual Walkthrough](#visual-walkthrough)
+- [Conformer Search Notes](#conformer-search-notes)
+- [MACE Head And Device Semantics](#mace-head-and-device-semantics)
 - [Surface and Site Dictionaries](#surface-and-site-dictionaries)
 - [Basin and Node Example](#basin-and-node-example)
 - [Output Files](#output-files)
@@ -133,11 +135,155 @@ import adsorption_ensemble
 
 如果你在做 batch relax，仍然可以把 relax backend 设成 `float32 + cuEq` 来换吞吐；但默认的 basin 去重已经切到 `mace_node_l2`，并使用 `fp64 + cueq off` 做更稳的特征比较。
 
+## Conformer Search Notes
+
+关于柔性吸附质的 `conformer_md` 设计、当前实现细节、预算语义、以及与
+DockOnSurf / CREST / Molclus-like 工作流的对照说明，见：
+
+- [`docs/theory/conformer_md_selection_and_budget.md`](docs/theory/conformer_md_selection_and_budget.md)
+- [`docs/theory/conformer_md_production_design_zh.md`](docs/theory/conformer_md_production_design_zh.md)
+- [`docs/theory/flexible_adsorption_case_design_zh.md`](docs/theory/flexible_adsorption_case_design_zh.md)
+
+如果你想直接用仓库里的真实输入做一次生产式构象搜索，推荐从
+[`examples/C6H14.gjf`](examples/C6H14.gjf) 开始，并用：
+
+```bash
+python tools/run_c6_conformer_search.py \
+  --input examples/C6H14.gjf \
+  --profile adsorption_seed_broad \
+  --work-root artifacts/c6h14_profile_compare/conformer_md \
+  --save-all-frames
+```
+
+这条入口默认采用当前推荐的 adsorption-coupled 语义：
+
+- `selection_profile="adsorption_seed_broad"`
+- `target_final_k=8`
+- `preselect_k=max(96, 6 * target_final_k)`
+- `metric_backend="mace"`
+- MACE feature compare: `float64 + cueq off`
+- MD seeds: `seed_mode="increment_per_run"`
+
+如果你的目标是更严格的孤立态构象搜索，可以把 profile 切成：
+
+```bash
+python tools/run_c6_conformer_search.py \
+  --input examples/C6H14.gjf \
+  --profile isolated_strict
+```
+
+两种 profile 的差别不是“谁保留更多最终构象”，而是：
+
+- `isolated_strict`
+  - 更窄的能窗
+  - 更大的最终预算，默认 `target_final_k=12`
+- `adsorption_seed_broad`
+  - 更宽的能窗，避免过早丢掉可能对表面吸附有利的气相次优构象
+  - 更小的下游 handoff 预算，默认 `target_final_k=8`
+
+当前 `conformer_md` 也支持把 raw 构象生成 backend 切成 `rdkit_embed`。例如：
+
+```bash
+python -m adsorption_ensemble.conformer_md.cli examples/C6H14.gjf \
+  --generator-backend rdkit_embed \
+  --selection-profile manual \
+  --target-final-k 8 \
+  --descriptor-backend geometry \
+  --relax-backend identity \
+  --rdkit-num-confs 96 \
+  --rdkit-prune-rms-thresh 0.15 \
+  --rdkit-optimize-forcefield mmff
+```
+
+如果你想直接比较 `xtb_md` 和 `rdkit_embed`，可以运行：
+
+```bash
+python tools/run_conformer_backend_benchmark.py examples/C6H14.gjf \
+  --out-root artifacts/conformer_backend_benchmark_c6h14 \
+  --selection-profile manual \
+  --target-final-k 8 \
+  --descriptor-backend geometry \
+  --relax-backend identity
+```
+
 也可以通过环境变量设置模型路径：
 
 ```bash
 export AE_MACE_MODEL_PATH=/path/to/mace-omat-0-small.model
 ```
+
+如果你想直接跑一组面向柔性吸附质的生产式 case，可以使用：
+
+```bash
+python tools/run_flexible_adsorption_suite.py \
+  --out-root artifacts/flexible_adsorption_suite \
+  --mace-model-path /root/.cache/mace/mace-mh-1.model \
+  --mace-device cuda
+```
+
+这个 suite 默认覆盖三类 DockOnSurf-style 关注点：
+
+- `TiO2_110 + CH3COOH`
+  - O-rich、可多锚定、对表面化学环境敏感
+- `CuNi_fcc111_alloy + CH3CONH2`
+  - 柔性酰胺在异质金属表面上的构象/取向/局域成分耦合
+- `Pt_fcc111 + CH3CH2OH`
+  - 小分子单转动自由度吸附质的构象与取向联动
+
+如果当前机器拿不到 GPU，suite 会把 `MACE batch relax` 显式切到 `cpu`
+执行，并在 runtime manifest 与 case summary 中记录这一点。
+
+## MACE Head And Device Semantics
+
+当前仓库里，`MACE head` 和 `device` 的生产语义已经显式化，不再依赖隐式假设。
+
+### Head name
+
+- 对 `conformer_md` 的 MACE inference 来说：
+  - 如果你显式传了非空、且不等于 `Default` 的 `head_name`，代码会优先使用它
+  - 不再静默退回到 model 自带的默认 head
+- metadata 现在会写出：
+  - `head_name`
+  - `available_heads`
+
+因此，当你在 CLI 或 Python 配置里写：
+
+```bash
+--mace-head-name omol
+```
+
+最终运行记录里就应该看到 `head_name = "omol"`；如果你没显式指定，才会退回到
+model 暴露的首个可用 head。
+
+### Device
+
+- `conformer_md` 里的 MACE inference 会区分：
+  - `requested_device`
+  - `runtime_device`
+- 如果你请求的是 `cuda`，但当前会话里 `torch.cuda.is_available()` 为 `False`：
+  - inference 会自动回退到 `cpu`
+  - metadata 会保留 `requested_device="cuda"` 与 `runtime_device="cpu"`
+
+这意味着：
+
+- 你可以从 artifact 中明确区分“配置本来想跑在哪”和“这次实际上跑在哪”
+- 不会再出现 `torch.load(..., map_location="cuda")` 直接因无 GPU 崩掉的情况
+
+对于 adsorption workflow 的 batch relax：
+
+- 如果你要求“拿不到 CUDA 就直接失败”，用：
+  - `MaceRelaxConfig(strict=True, device="cuda")`
+- 如果你允许当前机器降级到 CPU 继续产出 artifact：
+  - 显式把 relax backend 设到 `device="cpu"`
+  - 或在你自己的 wrapper 里先解析 runtime device 再构造 backend
+
+推荐实践：
+
+- 结构比较 / basin dedup：
+  - `float64 + cueq off`
+- batch relax：
+  - `float32 + cueq on` 仅在真正有 CUDA 时作为吞吐优化
+  - CPU 路径不要把它误当成和 CUDA 同一性能档位
 
 ## How To Use This Repo
 

@@ -257,6 +257,7 @@ class AdsorptionEnsembleRequest:
     signature_mode: str = DEFAULT_BASIN_SIGNATURE_MODE
     pose_overrides: dict[str, Any] = field(default_factory=dict)
     basin_overrides: dict[str, Any] = field(default_factory=dict)
+    node_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -279,6 +280,7 @@ def generate_adsorption_ensemble(
     signature_mode: str = DEFAULT_BASIN_SIGNATURE_MODE,
     pose_overrides: dict[str, Any] | None = None,
     basin_overrides: dict[str, Any] | None = None,
+    node_overrides: dict[str, Any] | None = None,
     basin_relax_backend: object | None = None,
     md_runner: object | None = None,
     conformer_descriptor_extractor: object | None = None,
@@ -295,6 +297,7 @@ def generate_adsorption_ensemble(
         signature_mode=str(signature_mode),
         pose_overrides=dict(pose_overrides or {}),
         basin_overrides=dict(basin_overrides or {}),
+        node_overrides=dict(node_overrides or {}),
     )
     cfg = make_adsorption_workflow_config(
         work_dir=req.work_dir,
@@ -305,6 +308,7 @@ def generate_adsorption_ensemble(
         signature_mode=req.signature_mode,
         pose_overrides=req.pose_overrides,
         basin_overrides=req.basin_overrides,
+        node_overrides=req.node_overrides,
     )
     cfg.run_conformer_search = bool(req.schedule.run_conformer_search)
     cfg.pre_relax_selection = req.schedule.pre_relax_selection
@@ -326,6 +330,7 @@ def generate_adsorption_ensemble(
         "schedule": asdict(req.schedule),
         "dedup_metric": str(req.dedup_metric),
         "signature_mode": str(req.signature_mode),
+        "node_overrides": dict(req.node_overrides),
         "n_surface_atoms": int(workflow.summary["n_surface_atoms"]),
         "n_basis_primitives": int(workflow.summary["n_basis_primitives"]),
         "n_pose_frames": int(workflow.summary["n_pose_frames"]),

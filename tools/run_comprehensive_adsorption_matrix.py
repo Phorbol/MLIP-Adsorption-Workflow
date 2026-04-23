@@ -15,7 +15,7 @@ from ase.spacegroup import crystal
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adsorption_ensemble.basin import BasinConfig
-from adsorption_ensemble.conformer_md import ConformerMDSamplerConfig
+from adsorption_ensemble.conformer_md import ConformerMDSamplerConfig, resolve_selection_profile
 from adsorption_ensemble.pose import PoseSamplerConfig
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.site import PrimitiveEmbeddingConfig
@@ -164,6 +164,7 @@ def build_workflow_config(
     conformer_cfg.md.step_fs = 1.0
     conformer_cfg.md.dump_fs = 50.0
     conformer_cfg.md.n_runs = (2 if budget is None else int(budget.md_runs))
+    conformer_cfg.md.seed_mode = "increment_per_run"
     conformer_cfg.descriptor.backend = "mace"
     conformer_cfg.descriptor.mace.model_path = mace_model_path
     conformer_cfg.descriptor.mace.device = str(mace_device)
@@ -184,6 +185,20 @@ def build_workflow_config(
     conformer_cfg.selection.fps_convergence_patience = 3
     conformer_cfg.output.save_all_frames = True
     conformer_cfg.output.work_dir = work_dir / "conformer_md"
+    if budget is None:
+        conformer_cfg.selection.target_final_k = 8
+        conformer_cfg.selection.selection_profile = "adsorption_seed_broad"
+        conformer_cfg = resolve_selection_profile(
+            conformer_cfg,
+            profile="adsorption_seed_broad",
+            target_final_k=8,
+        )
+    else:
+        conformer_cfg = resolve_selection_profile(
+            conformer_cfg,
+            profile=str(budget.selection_profile),
+            target_final_k=int(budget.target_final_k),
+        )
     return AdsorptionWorkflowConfig(
         work_dir=work_dir,
         surface_preprocessor=make_default_surface_preprocessor(),
