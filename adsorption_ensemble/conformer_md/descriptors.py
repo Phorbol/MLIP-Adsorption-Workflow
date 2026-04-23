@@ -47,8 +47,10 @@ class GeometryPairDistanceDescriptor:
 class MACEInvariantDescriptor:
     inferencer: MACEBatchInferencer
     last_infer_metadata: dict | None = None
+    last_energies_ev: np.ndarray | None = None
 
     def transform(self, frames: list[Atoms]) -> np.ndarray:
         out = self.inferencer.infer(frames)
         self.last_infer_metadata = dict(out.metadata)
+        self.last_energies_ev = np.asarray(out.energies_per_atom_ev, dtype=float)
         return np.asarray(out.descriptors, dtype=float)

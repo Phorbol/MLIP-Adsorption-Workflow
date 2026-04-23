@@ -10,7 +10,7 @@ from ase.collections import g2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adsorption_ensemble.conformer_md import ConformerMDSamplerConfig
+from adsorption_ensemble.conformer_md import ConformerMDSamplerConfig, resolve_selection_profile
 from adsorption_ensemble.relax.backends import MACEBatchRelaxBackend, MaceRelaxConfig
 from adsorption_ensemble.workflows import (
     evaluate_adsorption_workflow_readiness,
@@ -86,6 +86,7 @@ def _configure_flexible_search(
     conformer_cfg.md.step_fs = 1.0
     conformer_cfg.md.dump_fs = 50.0
     conformer_cfg.md.n_runs = int(budget.md_runs)
+    conformer_cfg.md.seed_mode = "increment_per_run"
     conformer_cfg.descriptor.backend = "mace"
     conformer_cfg.descriptor.mace.model_path = mace_model_path
     conformer_cfg.descriptor.mace.device = str(mace_device)
@@ -108,6 +109,11 @@ def _configure_flexible_search(
     conformer_cfg.selection.fps_convergence_patience = 3
     conformer_cfg.output.save_all_frames = True
     conformer_cfg.output.work_dir = case_dir / "conformer_md"
+    conformer_cfg = resolve_selection_profile(
+        conformer_cfg,
+        profile=str(budget.selection_profile),
+        target_final_k=int(budget.target_final_k),
+    )
     cfg.run_conformer_search = True
     cfg.conformer_config = conformer_cfg
     cfg.conformer_job_name = "conformer_search"

@@ -20,6 +20,9 @@ class XTBMDRunner:
     def __init__(self, config: XTBMDConfig):
         self.config = config
 
+    def generate(self, molecule: Atoms, run_dir: Path) -> MDRunResult:
+        return self.run(molecule, run_dir)
+
     def run(self, molecule: Atoms, run_dir: Path) -> MDRunResult:
         run_dir.mkdir(parents=True, exist_ok=True)
         input_xyz = run_dir / "input.xyz"

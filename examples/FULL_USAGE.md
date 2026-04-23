@@ -99,6 +99,11 @@ python tools/wsl_run_fcc211_co_demo.py \
 - `tools/run_conformer_param_sweep.py`
 - `tools/run_conformer_final_report_600k.py`
 
+其中 `tools/run_c6_conformer_search.py` 现在默认直接读取
+`examples/C6H14.gjf`，并走 production-oriented 的
+`selection_profile="adsorption_seed_broad"` 语义；如果你想做更严格的孤立态
+筛选，可加 `--profile isolated_strict`。
+
 如果没有 XTB，也可以参考 `tools/full_repo_example.py` 里用 FakeMDRunner 的方式把整个 pipeline（descriptor/selection/relax/output）跑通，用于调参/调流程。
 
 ## 4) 用 plot.py 批量推理与作图（MACE 数据集评估/可视化）

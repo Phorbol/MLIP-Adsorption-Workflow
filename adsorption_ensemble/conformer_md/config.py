@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,13 +17,38 @@ class XTBMDConfig:
     xtb_executable: str = "xtb"
     gfnff: bool = True
     n_runs: int = 1
+    seed_mode: str = "increment_per_run"
+
+
+@dataclass
+class RDKitEmbedConfig:
+    num_confs: int = 128
+    prune_rms_thresh: float = 0.25
+    embed_method: str = "etkdg_v3"
+    random_seed: int = 42
+    use_random_coords: bool = False
+    num_threads: int = 1
+    optimize_forcefield: str = "mmff"
+    max_opt_iters: int = 200
+
+
+@dataclass
+class ConformerGeneratorConfig:
+    backend: str = "xtb_md"
+    xtb: XTBMDConfig = field(default_factory=XTBMDConfig)
+    rdkit: RDKitEmbedConfig = field(default_factory=RDKitEmbedConfig)
 
 
 @dataclass
 class SelectionConfig:
     preselect_k: int = 64
+    target_final_k: int | None = None
+    selection_profile: str = "manual"
     mode: str = "fps_pca_kmeans"
+    metric_backend: str = "auto"
     energy_window_ev: float = 0.20
+    pair_energy_gap_ev: float = 0.0
+    use_total_energy: bool = True
     rmsd_threshold: float = 0.05
     loose_filter: str = "dual"
     final_filter: str = "dual"
@@ -43,6 +69,14 @@ class SelectionConfig:
     fps_convergence_patience: int = 3
     fps_convergence_min_coverage_gain: float = 1e-3
     fps_convergence_min_novelty: float = 5e-2
+
+    @property
+    def structure_metric_threshold(self) -> float:
+        return float(self.rmsd_threshold)
+
+    @structure_metric_threshold.setter
+    def structure_metric_threshold(self, value: float) -> None:
+        self.rmsd_threshold = float(value)
 
 
 @dataclass
@@ -87,8 +121,56 @@ class EnsembleOutputConfig:
 
 @dataclass
 class ConformerMDSamplerConfig:
-    md: XTBMDConfig = field(default_factory=XTBMDConfig)
+    generator: ConformerGeneratorConfig = field(default_factory=ConformerGeneratorConfig)
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     descriptor: DescriptorConfig = field(default_factory=DescriptorConfig)
     relax: RelaxConfig = field(default_factory=RelaxConfig)
     output: EnsembleOutputConfig = field(default_factory=EnsembleOutputConfig)
+
+    @property
+    def md(self) -> XTBMDConfig:
+        return self.generator.xtb
+
+    @md.setter
+    def md(self, value: XTBMDConfig) -> None:
+        self.generator.xtb = value
+
+
+def resolve_selection_profile(
+    config: ConformerMDSamplerConfig,
+    *,
+    profile: str,
+    target_final_k: int | None = None,
+) -> ConformerMDSamplerConfig:
+    out = copy.deepcopy(config)
+    key = str(profile).strip().lower()
+    if key in {"manual", ""}:
+        out.selection.selection_profile = "manual"
+        return out
+    if key == "isolated_strict":
+        k_final = int(target_final_k if target_final_k is not None else (out.selection.target_final_k or 12))
+        out.selection.selection_profile = "isolated_strict"
+        out.selection.target_final_k = int(k_final)
+        out.selection.preselect_k = int(max(64, 4 * k_final))
+        out.selection.energy_window_ev = 0.20
+        out.selection.pair_energy_gap_ev = 0.02
+        out.selection.metric_backend = "mace"
+        out.selection.use_total_energy = True
+        out.descriptor.backend = "mace"
+        out.descriptor.mace.dtype = "float64"
+        out.descriptor.mace.enable_cueq = False
+        return out
+    if key == "adsorption_seed_broad":
+        k_final = int(target_final_k if target_final_k is not None else (out.selection.target_final_k or 8))
+        out.selection.selection_profile = "adsorption_seed_broad"
+        out.selection.target_final_k = int(k_final)
+        out.selection.preselect_k = int(max(96, 6 * k_final))
+        out.selection.energy_window_ev = 0.60
+        out.selection.pair_energy_gap_ev = 0.01
+        out.selection.metric_backend = "mace"
+        out.selection.use_total_energy = True
+        out.descriptor.backend = "mace"
+        out.descriptor.mace.dtype = "float64"
+        out.descriptor.mace.enable_cueq = False
+        return out
+    raise ValueError(f"Unsupported selection profile: {profile}")

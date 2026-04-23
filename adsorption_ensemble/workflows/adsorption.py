@@ -243,18 +243,30 @@ def run_adsorption_workflow(
         energy_min_ev = None if energy_min is None else float(energy_min)
     except Exception:
         energy_min_ev = None
-    nodes = [basin_to_node(b, slab_n=len(slab), cfg=cfg.node_config, energy_min_ev=energy_min_ev) for b in basin_result.basins]
+    nodes = [
+        basin_to_node(
+            b,
+            slab_n=len(slab),
+            cfg=cfg.node_config,
+            energy_min_ev=energy_min_ev,
+            surface_reference=slab,
+        )
+        for b in basin_result.basins
+    ]
     nodes_json = work_dir / "nodes.json"
     _write_json(
         nodes_json,
         [
             {
                 "node_id": str(n.node_id),
+                "node_id_legacy": str(n.node_id_legacy),
                 "basin_id": int(n.basin_id),
                 "canonical_order": [int(x) for x in n.canonical_order],
                 "atomic_numbers": [int(x) for x in n.atomic_numbers],
                 "internal_bonds": [(int(i), int(j)) for i, j in n.internal_bonds],
                 "binding_pairs": [(int(i), int(j)) for i, j in n.binding_pairs],
+                "surface_env_key": (None if n.surface_env_key is None else str(n.surface_env_key)),
+                "surface_geometry_key": (None if n.surface_geometry_key is None else str(n.surface_geometry_key)),
                 "denticity": int(n.denticity),
                 "relative_energy_ev": (None if n.relative_energy_ev is None else float(n.relative_energy_ev)),
                 "provenance": dict(n.provenance),
@@ -270,6 +282,7 @@ def run_adsorption_workflow(
             pose_frames=pose_frames,
             nodes=nodes,
             slab_n=len(slab),
+            surface_reference=slab,
         )
         basin_dict_path = work_dir / "basin_dictionary.json"
         _write_json(basin_dict_path, basin_dict)

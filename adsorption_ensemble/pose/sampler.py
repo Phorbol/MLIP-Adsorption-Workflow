@@ -131,6 +131,10 @@ class PoseSamplerConfig:
     neighborlist_cutoff_padding: float = 0.30
     nonlinear_atom_down_coverage: bool = True
     nonlinear_atom_down_max_vectors: int = 4
+    planar_nonlinear_safeguard: bool = True
+    planar_like_ratio_threshold: float = 0.08
+    planar_family_flat_max_deg: float = 20.0
+    planar_family_tilted_max_deg: float = 70.0
     adaptive_height_fallback: bool = True
     adaptive_height_fallback_step: float = 0.20
     adaptive_height_fallback_max_extra: float = 1.60
@@ -152,6 +156,7 @@ class PoseCandidate:
     height: float
     com: np.ndarray
     atoms: Atoms
+    orientation_family: str | None = None
 
 
 class PoseSampler:
@@ -421,6 +426,7 @@ class PoseSampler:
             height=float(height),
             com=np.asarray(placed.get_center_of_mass(), dtype=float),
             atoms=placed,
+            orientation_family=self._classify_orientation_family(rotated_adsorbate, np.asarray(normal, dtype=float), str(mol_class)),
         )
         if prof is not None:
             prof["n_candidates_raw"] += 1
@@ -799,9 +805,11 @@ class PoseSampler:
         if n <= 1 or radius <= 0:
             return [np.zeros(2, dtype=float)]
         shifts: list[np.ndarray] = [np.zeros(2, dtype=float)]
-        for _ in range(n - 1):
-            ang = 2.0 * np.pi * rng.random()
-            rr = float(radius) * np.sqrt(rng.random())
+        golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+        for k in range(1, n):
+            frac = float(k) / float(max(1, n - 1))
+            rr = float(radius) * np.sqrt(frac)
+            ang = float((k - 1) * golden_angle)
             shifts.append(np.array([rr * np.cos(ang), rr * np.sin(ang)], dtype=float))
         return shifts
 
@@ -1092,31 +1100,71 @@ class PoseSampler:
     def _select_site_candidates(site_candidates: list[PoseCandidate], max_keep: int) -> list[PoseCandidate]:
         if max_keep <= 0 or len(site_candidates) <= max_keep:
             return site_candidates[: max_keep] if max_keep > 0 else []
-        buckets: dict[tuple[int, int], list[PoseCandidate]] = {}
-        for cand in site_candidates:
-            tilt_bin = 0
-            if cand.tilt_deg >= 60.0:
-                tilt_bin = 2
-            elif cand.tilt_deg >= 30.0:
-                tilt_bin = 1
-            key = (int(cand.azimuth_index), int(cand.rotation_index), int(tilt_bin))
-            buckets.setdefault(key, []).append(cand)
-        for arr in buckets.values():
-            arr.sort(key=lambda x: x.height)
-        ordered_keys = sorted(buckets.keys(), key=lambda k: (k[0], k[1]))
         selected: list[PoseCandidate] = []
-        while len(selected) < max_keep:
-            changed = False
-            for k in ordered_keys:
-                if buckets[k]:
-                    selected.append(buckets[k].pop(0))
-                    changed = True
-                    if len(selected) >= max_keep:
-                        break
-            if not changed:
-                break
+        planar_families = ("flat", "tilted", "upright")
+        active_families = [family for family in planar_families if any(str(c.orientation_family) == family for c in site_candidates)]
+        if len(active_families) >= 2:
+            remaining = list(site_candidates)
+            for family in planar_families:
+                family_candidates = [cand for cand in remaining if str(cand.orientation_family) == family]
+                if not family_candidates or len(selected) >= max_keep:
+                    continue
+                family_candidates.sort(key=lambda x: x.height)
+                keep = family_candidates[0]
+                selected.append(keep)
+                remaining = [cand for cand in remaining if cand is not keep]
+            site_candidates = remaining
+            if len(selected) >= max_keep:
+                selected.sort(key=lambda x: x.height)
+                return selected[:max_keep]
+        selected = PoseSampler._extend_pose_subset_by_coverage(selected, site_candidates, max_keep)
         selected.sort(key=lambda x: x.height)
         return selected
+
+    @staticmethod
+    def _extend_pose_subset_by_coverage(
+        selected: list[PoseCandidate],
+        candidates: list[PoseCandidate],
+        max_keep: int,
+    ) -> list[PoseCandidate]:
+        picked = list(selected)
+        remaining = [cand for cand in candidates if all(cand is not ref for ref in picked)]
+        if max_keep <= 0:
+            return []
+        if not picked and remaining:
+            remaining.sort(key=lambda x: x.height)
+            picked.append(remaining.pop(0))
+        while len(picked) < max_keep and remaining:
+            best_idx = 0
+            best_key: tuple[float, float, float, float] | None = None
+            for idx, cand in enumerate(remaining):
+                dist = PoseSampler._pose_candidate_min_distance(cand, picked)
+                key = (
+                    float(dist),
+                    -float(cand.height),
+                    -float(abs(cand.tilt_deg - 45.0)),
+                    -float(idx),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_idx = idx
+            picked.append(remaining.pop(best_idx))
+        return picked[:max_keep]
+
+    @staticmethod
+    def _pose_candidate_min_distance(cand: PoseCandidate, refs: list[PoseCandidate]) -> float:
+        if not refs:
+            return np.inf
+        return float(min(PoseSampler._pose_candidate_distance(cand, ref) for ref in refs))
+
+    @staticmethod
+    def _pose_candidate_distance(a: PoseCandidate, b: PoseCandidate) -> float:
+        rot = float(PoseSampler._quaternion_distance(a.quaternion, b.quaternion) / np.pi)
+        shift_scale = max(1e-8, float(np.linalg.norm(a.shift_uv)) + float(np.linalg.norm(b.shift_uv)) + 1e-8)
+        d_shift = float(np.linalg.norm(np.asarray(a.shift_uv, dtype=float) - np.asarray(b.shift_uv, dtype=float)) / shift_scale)
+        height_scale = max(0.1, abs(float(a.height)) + abs(float(b.height)))
+        d_height = abs(float(a.height) - float(b.height)) / height_scale
+        return float(np.sqrt(rot * rot + 0.35 * d_shift * d_shift + 0.15 * d_height * d_height))
 
     def _effective_sampling_budget(self, mol_class: str) -> tuple[int, int, int]:
         n_rot = max(1, int(self.config.n_rotations))
@@ -1265,24 +1313,33 @@ class PoseSampler:
         elif mol_class == "nonlinear":
             normal_u = np.asarray(normal, dtype=float)
             normal_u = normal_u / (np.linalg.norm(normal_u) + 1e-12)
+            planar_like = bool(getattr(self.config, "planar_nonlinear_safeguard", True)) and self._is_planar_like_nonlinear(
+                adsorbate_centered
+            )
+            atom_down_quats: list[np.ndarray] = []
             if bool(getattr(self.config, "nonlinear_atom_down_coverage", True)):
                 max_vectors = max(1, int(getattr(self.config, "nonlinear_atom_down_max_vectors", 4)))
-                for q_down in self._nonlinear_atom_down_quaternions(
+                atom_down_quats = self._nonlinear_atom_down_quaternions(
                     adsorbate_centered,
-                    max_vectors=min(int(n_rot), int(max_vectors)),
+                    max_vectors=min(max(int(n_rot), 1), int(max_vectors)),
                     normal=normal_u,
-                ):
-                    self._append_unique_quaternion(out, q_down)
-                    if len(out) >= n_rot:
-                        return out[:n_rot]
+                )
             q_align = self._body_frame_alignment_quaternion(adsorbate_centered)
-            for q_body in self._body_frame_euler_schedule(n_rot):
+            body_quats: list[np.ndarray] = []
+            body_budget = max(int(n_rot), 8)
+            for q_body in self._body_frame_euler_schedule(body_budget):
                 q_use = np.asarray(q_body, dtype=float)
                 if q_align is not None:
                     q_use = self._quaternion_multiply(q_body, q_align)
-                self._append_unique_quaternion(out, q_use)
-                if len(out) >= n_rot:
-                    return out[:n_rot]
+                self._append_unique_quaternion(body_quats, q_use)
+            return self._select_nonlinear_quaternions(
+                adsorbate_centered=adsorbate_centered,
+                normal=normal_u,
+                body_quats=body_quats,
+                atom_down_quats=atom_down_quats,
+                n_rot=int(n_rot),
+                planar_like=bool(planar_like),
+            )
         while len(out) < n_rot:
             self._append_unique_quaternion(out, self._sample_uniform_quaternion(rng))
         return out[:n_rot]
@@ -1294,6 +1351,11 @@ class PoseSampler:
             if self._quaternion_distance(q, ref) <= float(tol):
                 return
         acc.append(q)
+
+    def _classify_orientation_family(self, adsorbate_centered: Atoms, normal: np.ndarray, mol_class: str) -> str | None:
+        if str(mol_class) == "nonlinear" and self._is_planar_like_nonlinear(adsorbate_centered):
+            return self._classify_planar_family(self._planar_pose_angle_deg(adsorbate_centered, normal))
+        return None
 
     @staticmethod
     def _estimate_tilt_deg(adsorbate_centered: Atoms, normal: np.ndarray) -> float:
@@ -1312,6 +1374,17 @@ class PoseSampler:
         if axes is None:
             return None
         axis = np.asarray(axes[:, 0], dtype=float)
+        n = np.linalg.norm(axis)
+        if n < 1e-12:
+            return None
+        return axis / n
+
+    @staticmethod
+    def _planar_normal(adsorbate_centered: Atoms) -> np.ndarray | None:
+        axes = PoseSampler._principal_axes(adsorbate_centered)
+        if axes is None:
+            return None
+        axis = np.asarray(axes[:, -1], dtype=float)
         n = np.linalg.norm(axis)
         if n < 1e-12:
             return None
@@ -1404,6 +1477,85 @@ class PoseSampler:
                 break
         return [np.asarray(q, dtype=float) for q in out]
 
+    def _select_nonlinear_quaternions(
+        self,
+        *,
+        adsorbate_centered: Atoms,
+        normal: np.ndarray,
+        body_quats: list[np.ndarray],
+        atom_down_quats: list[np.ndarray],
+        n_rot: int,
+        planar_like: bool,
+    ) -> list[np.ndarray]:
+        if n_rot <= 0:
+            return []
+        candidate_entries: list[tuple[str, str, np.ndarray]] = []
+        for source, quats in (("body", body_quats), ("atom_down", atom_down_quats)):
+            for quat in quats:
+                q = np.asarray(quat, dtype=float)
+                family = ""
+                if planar_like:
+                    rotated = self._rotated_adsorbate(adsorbate_centered, q)
+                    family = self._classify_planar_family(self._planar_pose_angle_deg(rotated, normal))
+                candidate_entries.append((source, family, q))
+        selected: list[np.ndarray] = []
+        if planar_like:
+            for family in ("flat", "tilted", "upright"):
+                family_entries = [entry for entry in candidate_entries if entry[1] == family]
+                family_entries.sort(key=lambda entry: (0 if entry[0] == "body" else 1))
+                for _, _, quat in family_entries:
+                    if any(self._quaternion_distance(quat, ref) <= 1e-6 for ref in selected):
+                        continue
+                    selected.append(np.asarray(quat, dtype=float))
+                    break
+                if len(selected) >= int(n_rot):
+                    return selected[: int(n_rot)]
+        else:
+            for source in ("body", "atom_down"):
+                source_entries = [entry for entry in candidate_entries if entry[0] == source]
+                if not source_entries:
+                    continue
+                source_entries.sort(key=lambda entry: (0 if entry[0] == "body" else 1))
+                quat = np.asarray(source_entries[0][2], dtype=float)
+                if any(self._quaternion_distance(quat, ref) <= 1e-6 for ref in selected):
+                    continue
+                selected.append(quat)
+                if len(selected) >= int(n_rot):
+                    return selected[: int(n_rot)]
+        return self._select_quaternion_subset_by_coverage(candidate_entries, selected, n_rot)
+
+    def _select_quaternion_subset_by_coverage(
+        self,
+        candidate_entries: list[tuple[str, str, np.ndarray]],
+        seeds: list[np.ndarray],
+        n_rot: int,
+    ) -> list[np.ndarray]:
+        selected: list[np.ndarray] = [np.asarray(q, dtype=float) for q in seeds[: int(n_rot)]]
+        remaining: list[tuple[str, str, np.ndarray]] = []
+        for entry in candidate_entries:
+            quat = np.asarray(entry[2], dtype=float)
+            if any(self._quaternion_distance(quat, ref) <= 1e-6 for ref in selected):
+                continue
+            remaining.append((str(entry[0]), str(entry[1]), quat))
+        if not selected and remaining:
+            remaining.sort(key=lambda entry: (0 if entry[0] == "body" else 1))
+            selected.append(np.asarray(remaining.pop(0)[2], dtype=float))
+        while len(selected) < int(n_rot) and remaining:
+            best_idx = 0
+            best_key: tuple[float, int, float] | None = None
+            for idx, (source, _, quat) in enumerate(remaining):
+                min_dist = min(self._quaternion_distance(quat, ref) for ref in selected) if selected else np.inf
+                key = (
+                    float(min_dist),
+                    1 if str(source) == "body" else 0,
+                    -float(idx),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_idx = idx
+            selected.append(np.asarray(remaining.pop(best_idx)[2], dtype=float))
+        return selected[: int(n_rot)]
+
     @staticmethod
     def _best_frame_direction(rel_vectors: np.ndarray) -> np.ndarray:
         rel = np.asarray(rel_vectors, dtype=float)
@@ -1458,6 +1610,25 @@ class PoseSampler:
             if quat is not None:
                 out.append(quat)
         return out[:n]
+
+    def _planar_pose_angle_deg(self, adsorbate_centered: Atoms, normal: np.ndarray) -> float:
+        plane_normal = self._planar_normal(adsorbate_centered)
+        n = np.asarray(normal, dtype=float)
+        n = n / (np.linalg.norm(n) + 1e-12)
+        if plane_normal is None:
+            return 90.0
+        c = abs(float(np.dot(plane_normal, n)))
+        c = min(1.0, max(-1.0, c))
+        return float(np.degrees(np.arccos(c)))
+
+    def _classify_planar_family(self, angle_deg: float) -> str:
+        flat_max = float(getattr(self.config, "planar_family_flat_max_deg", 20.0))
+        tilted_max = float(getattr(self.config, "planar_family_tilted_max_deg", 70.0))
+        if float(angle_deg) < flat_max:
+            return "flat"
+        if float(angle_deg) < tilted_max:
+            return "tilted"
+        return "upright"
 
     @staticmethod
     def _reference_tangent(normal: np.ndarray) -> np.ndarray:
@@ -1597,6 +1768,20 @@ class PoseSampler:
         if evals[1] / evals[-1] < 1e-3:
             return "linear"
         return "nonlinear"
+
+    def _is_planar_like_nonlinear(self, adsorbate: Atoms) -> bool:
+        if str(self._classify_molecule_shape(adsorbate)) != "nonlinear":
+            return False
+        pos = np.asarray(adsorbate.get_positions(), dtype=float)
+        if len(pos) < 4:
+            return False
+        pos = pos - np.mean(pos, axis=0, keepdims=True)
+        cov = pos.T @ pos
+        evals = np.sort(np.linalg.eigvalsh(cov))
+        if float(evals[1]) <= 1e-12:
+            return False
+        ratio = float(evals[0] / evals[1])
+        return bool(ratio < float(getattr(self.config, "planar_like_ratio_threshold", 0.08)))
 
     @staticmethod
     def _quaternion_distance(q1: np.ndarray, q2: np.ndarray) -> float:

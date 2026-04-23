@@ -98,6 +98,7 @@ class PoseSweepConfig:
     ensemble_burial_margin: float = 0.30
     node_bond_tau: float = 1.20
     node_hash_len: int = 20
+    node_identity_mode: str = "legacy_absolute"
 
 
 def _safe_name(name: str) -> str:
@@ -931,16 +932,32 @@ def _run_ensemble_generation(
             energy_min = float(e0)
         except Exception:
             energy_min = None
-    ncfg = NodeConfig(bond_tau=float(cfg.node_bond_tau), node_hash_len=int(cfg.node_hash_len))
-    nodes = [basin_to_node(b, slab_n=len(slab), cfg=ncfg, energy_min_ev=energy_min) for b in out.basins]
+    ncfg = NodeConfig(
+        bond_tau=float(cfg.node_bond_tau),
+        node_hash_len=int(cfg.node_hash_len),
+        node_identity_mode=str(cfg.node_identity_mode),
+    )
+    nodes = [
+        basin_to_node(
+            b,
+            slab_n=len(slab),
+            cfg=ncfg,
+            energy_min_ev=energy_min,
+            surface_reference=slab,
+        )
+        for b in out.basins
+    ]
     nodes_payload = [
         {
             "node_id": str(n.node_id),
+            "node_id_legacy": str(n.node_id_legacy),
             "basin_id": int(n.basin_id),
             "canonical_order": [int(x) for x in n.canonical_order],
             "atomic_numbers": [int(x) for x in n.atomic_numbers],
             "internal_bonds": [(int(i), int(j)) for i, j in n.internal_bonds],
             "binding_pairs": [(int(i), int(j)) for i, j in n.binding_pairs],
+            "surface_env_key": (None if n.surface_env_key is None else str(n.surface_env_key)),
+            "surface_geometry_key": (None if n.surface_geometry_key is None else str(n.surface_geometry_key)),
             "denticity": int(n.denticity),
             "relative_energy_ev": (None if n.relative_energy_ev is None else float(n.relative_energy_ev)),
             "provenance": dict(n.provenance),
@@ -1059,6 +1076,7 @@ def _write_report(path: Path, run_dir: Path, cfg: PoseSweepConfig, rows: list[di
         f"- ensemble_desorption_min_bonds: {cfg.ensemble_desorption_min_bonds}",
         f"- node_bond_tau: {cfg.node_bond_tau}",
         f"- node_hash_len: {cfg.node_hash_len}",
+        f"- node_identity_mode: {cfg.node_identity_mode}",
         "",
     ]
     ok_rows = [r for r in rows if bool(r.get("ok", False))]

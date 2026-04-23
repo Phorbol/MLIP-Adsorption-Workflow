@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from adsorption_ensemble.basin import BasinConfig
+from adsorption_ensemble.node import NodeConfig
 from adsorption_ensemble.pose import PoseSamplerConfig
 from adsorption_ensemble.site import PrimitiveEmbeddingConfig
 from adsorption_ensemble.surface import ProbeScanDetector, SurfacePreprocessor, VoxelFloodDetector
@@ -99,6 +100,7 @@ def make_adsorption_workflow_config(
     signature_mode: str = DEFAULT_BASIN_SIGNATURE_MODE,
     pose_overrides: dict[str, Any] | None = None,
     basin_overrides: dict[str, Any] | None = None,
+    node_overrides: dict[str, Any] | None = None,
 ) -> AdsorptionWorkflowConfig:
     dedup_metric_norm = str(dedup_metric).strip().lower()
     surface_metric_aliases = {
@@ -138,6 +140,9 @@ def make_adsorption_workflow_config(
         )
     if basin_overrides:
         basin_kwargs.update(dict(basin_overrides))
+    node_kwargs: dict[str, Any] = {}
+    if node_overrides:
+        node_kwargs.update(dict(node_overrides))
     return AdsorptionWorkflowConfig(
         work_dir=Path(work_dir),
         surface_preprocessor=make_default_surface_preprocessor(),
@@ -148,6 +153,7 @@ def make_adsorption_workflow_config(
             overrides=pose_overrides,
         ),
         basin_config=BasinConfig(**basin_kwargs),
+        node_config=NodeConfig(**node_kwargs),
         max_selected_primitives=24,
         save_basin_dictionary=True,
         save_site_visualizations=True,

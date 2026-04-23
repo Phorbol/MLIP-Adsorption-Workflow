@@ -500,3 +500,101 @@ class TestBasinDedupMaceNodeL2(unittest.TestCase):
         self.assertEqual(meta["n_output_basins"], 2)
         self.assertEqual(meta["signature_mode"], "reference_canonical")
         self.assertEqual(len(merged), 2)
+
+    def test_reference_canonical_grouping_blocks_overmerge_across_distinct_surface_geometries(self):
+        surface_ref = Atoms(
+            symbols=["Pt", "Pt", "Pt"],
+            positions=[
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [1.0, 1.732, 0.0],
+            ],
+        )
+        frame_top_a = Atoms(
+            symbols=["Pt", "Pt", "Pt", "C", "O"],
+            positions=[
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [1.0, 1.732, 0.0],
+                [0.0, 0.0, 1.8],
+                [0.0, 0.0, 2.9],
+            ],
+        )
+        frame_top_b = frame_top_a.copy()
+        frame_top_b.positions[3:] += np.asarray([2.0, 0.0, 0.0], dtype=float)
+        frame_bridge = frame_top_a.copy()
+        frame_bridge.positions[3:] += np.asarray([1.0, 0.0, 0.0], dtype=float)
+
+        basins = [
+            {
+                "basin_id": 0,
+                "atoms": frame_top_a,
+                "energy": 0.0,
+                "member_candidate_ids": [0],
+                "binding_pairs": [(0, 0)],
+                "signature": "sig_top_a",
+            },
+            {
+                "basin_id": 1,
+                "atoms": frame_top_b,
+                "energy": 0.01,
+                "member_candidate_ids": [1],
+                "binding_pairs": [(0, 1)],
+                "signature": "sig_top_b",
+            },
+            {
+                "basin_id": 2,
+                "atoms": frame_bridge,
+                "energy": 0.02,
+                "member_candidate_ids": [2],
+                "binding_pairs": [(0, 0), (0, 1)],
+                "signature": "sig_bridge",
+            },
+        ]
+        n = len(frame_top_a)
+        d = 4
+        x0 = np.zeros((n, d), dtype=float)
+        x1 = np.zeros((n, d), dtype=float)
+        x2 = np.zeros((n, d), dtype=float)
+        x2[:, 0] = 0.05
+
+        grouped, grouped_meta = merge_basin_representatives_by_mace_node_l2(
+            basins=basins,
+            slab_n=3,
+            binding_tau=1.15,
+            node_l2_threshold=0.1,
+            mace_model_path=None,
+            mace_device="cpu",
+            mace_dtype="float32",
+            mace_max_edges_per_batch=1000,
+            mace_layers_to_keep=-1,
+            mace_head_name=None,
+            mace_mlp_energy_key=None,
+            node_descriptors=[x0, x1, x2],
+            signature_mode="reference_canonical",
+            use_signature_grouping=True,
+            surface_reference=surface_ref,
+        )
+        ungrouped, ungrouped_meta = merge_basin_representatives_by_mace_node_l2(
+            basins=basins,
+            slab_n=3,
+            binding_tau=1.15,
+            node_l2_threshold=0.1,
+            mace_model_path=None,
+            mace_device="cpu",
+            mace_dtype="float32",
+            mace_max_edges_per_batch=1000,
+            mace_layers_to_keep=-1,
+            mace_head_name=None,
+            mace_mlp_energy_key=None,
+            node_descriptors=[x0, x1, x2],
+            signature_mode="reference_canonical",
+            use_signature_grouping=False,
+            surface_reference=surface_ref,
+        )
+        self.assertEqual(grouped_meta["n_output_basins"], 2)
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(sorted(sorted(m["source_basin_ids"]) for m in grouped), [[0, 1], [2]])
+        self.assertEqual(ungrouped_meta["n_output_basins"], 1)
+        self.assertEqual(len(ungrouped), 1)
+        self.assertEqual(sorted(ungrouped[0]["source_basin_ids"]), [0, 1, 2])

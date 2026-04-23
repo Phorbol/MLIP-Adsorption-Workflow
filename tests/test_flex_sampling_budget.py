@@ -18,6 +18,8 @@ class TestFlexSamplingBudget(unittest.TestCase):
         self.assertGreater(b.md_time_ps, 0.0)
         self.assertGreaterEqual(b.md_runs, 2)
         self.assertGreaterEqual(b.preselect_k, 64)
+        self.assertEqual(b.selection_profile, "adsorption_seed_broad")
+        self.assertGreaterEqual(b.target_final_k, 8)
 
     def test_functionalized_aromatic_tends_to_enable_conformer(self):
         b = plan_flex_sampling_budget(make_para_nitrobenzoic_acid_like(), n_surface_atoms=24, n_site_primitives=48)
@@ -27,4 +29,3 @@ class TestFlexSamplingBudget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -7,7 +7,8 @@ import numpy as np
 from ase import Atoms
 
 from adsorption_ensemble.basin.pipeline import BasinBuilder
-from adsorption_ensemble.basin.types import BasinConfig, BasinResult
+from adsorption_ensemble.basin.types import Basin, BasinConfig, BasinResult
+from adsorption_ensemble.node import NodeConfig, basin_to_node
 from adsorption_ensemble.node.types import ReactionNode
 
 
@@ -70,6 +71,7 @@ def build_basin_dictionary(
     pose_frames: list[Atoms] | None = None,
     nodes: list[ReactionNode] | None = None,
     slab_n: int | None = None,
+    surface_reference: Atoms | None = None,
     member_frames_relaxed: bool = False,
 ) -> dict[str, Any]:
     basin_entries = []
@@ -123,6 +125,11 @@ def build_basin_dictionary(
                 "member_adsorbate_rmsd_mean": rmsd_stats["mean"],
                 "false_merge_suspect": (None if rmsd_stats["max"] is None else bool(rmsd_stats["max"] > 0.75)),
                 "node_id": (None if node is None else str(node.node_id)),
+                "node_id_legacy": (None if node is None else str(node.node_id_legacy)),
+                "surface_env_key": (None if node is None or node.surface_env_key is None else str(node.surface_env_key)),
+                "surface_geometry_key": (
+                    None if node is None or node.surface_geometry_key is None else str(node.surface_geometry_key)
+                ),
                 **binding_meta,
                 **provenance_meta,
             }
@@ -131,12 +138,22 @@ def build_basin_dictionary(
     for entry in basin_entries:
         signature_groups[str(entry["signature"])] = signature_groups.get(str(entry["signature"]), 0) + 1
     false_split_suspects = [sig for sig, count in signature_groups.items() if int(count) > 1]
+    node_inflation_audit = None
+    if nodes is not None and slab_n is not None and surface_reference is not None:
+        node_inflation_audit = build_node_inflation_audit(
+            basins=list(basin_result.basins),
+            slab_n=int(slab_n),
+            surface_reference=surface_reference,
+            observed_nodes=list(nodes),
+            node_cfg=NodeConfig(),
+        )
     return {
         "summary": dict(basin_result.summary),
         "relax_backend": str(basin_result.relax_backend),
         "n_basins": int(len(basin_entries)),
         "n_rejected": int(len(basin_result.rejected)),
         "false_split_suspect_signatures": sorted(false_split_suspects),
+        "node_inflation_audit": node_inflation_audit,
         "basins": basin_entries,
         "rejected": [
             {
@@ -269,3 +286,153 @@ def _member_rmsd_stats(member_frames: list[Atoms], slab_n: int | None) -> dict[s
         return {"min": 0.0, "max": 0.0, "mean": 0.0}
     arr = np.asarray(vals, dtype=float)
     return {"min": float(np.min(arr)), "max": float(np.max(arr)), "mean": float(np.mean(arr))}
+
+
+def _node_field(node: ReactionNode | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(node, dict):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
+def _group_node_rows(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row[key_name]), []).append(row)
+    out = []
+    for key, group in sorted(grouped.items(), key=lambda kv: (min(float(x["energy_ev"]) for x in kv[1]), kv[0])):
+        energies = [float(x["energy_ev"]) for x in group]
+        out.append(
+            {
+                "key": str(key),
+                "count": int(len(group)),
+                "basin_ids": [int(x["basin_id"]) for x in group],
+                "node_ids": sorted({str(x["node_id"]) for x in group}),
+                "node_id_legacies": sorted({str(x["node_id_legacy"]) for x in group}),
+                "signatures": sorted({str(x["signature"]) for x in group}),
+                "surface_env_keys": sorted({str(x["surface_env_key"]) for x in group}),
+                "surface_geometry_keys": sorted({str(x["surface_geometry_key"]) for x in group}),
+                "energy_min_ev": float(min(energies)),
+                "energy_max_ev": float(max(energies)),
+                "energy_span_ev": float(max(energies) - min(energies)),
+            }
+        )
+    return out
+
+
+def build_node_inflation_audit(
+    *,
+    basins: list[Basin],
+    slab_n: int,
+    surface_reference: Atoms,
+    observed_nodes: list[ReactionNode | dict[str, Any]] | None = None,
+    node_cfg: NodeConfig | None = None,
+    compare_modes: tuple[str, ...] = ("legacy_absolute", "surface_geometry"),
+) -> dict[str, Any]:
+    cfg_use = node_cfg or NodeConfig()
+    energy_min = (None if not basins else float(min(float(b.energy_ev) for b in basins)))
+
+    observed_by_basin: dict[int, ReactionNode | dict[str, Any]] = {}
+    for node in observed_nodes or []:
+        basin_id = _node_field(node, "basin_id", None)
+        if basin_id is None:
+            continue
+        observed_by_basin[int(basin_id)] = node
+
+    rows_observed: list[dict[str, Any]] = []
+    for basin in basins:
+        obs = observed_by_basin.get(int(basin.basin_id))
+        if obs is None:
+            continue
+        rows_observed.append(
+            {
+                "basin_id": int(basin.basin_id),
+                "signature": str(basin.signature),
+                "energy_ev": float(basin.energy_ev),
+                "node_id": str(_node_field(obs, "node_id", "")),
+                "node_id_legacy": str(_node_field(obs, "node_id_legacy", _node_field(obs, "node_id", ""))),
+                "surface_env_key": str(_node_field(obs, "surface_env_key", "")),
+                "surface_geometry_key": str(_node_field(obs, "surface_geometry_key", "")),
+            }
+        )
+
+    rows_by_mode: dict[str, list[dict[str, Any]]] = {"observed": rows_observed}
+    for mode in compare_modes:
+        cfg_mode = NodeConfig(
+            bond_tau=float(cfg_use.bond_tau),
+            node_hash_len=int(cfg_use.node_hash_len),
+            node_identity_mode=str(mode),
+        )
+        nodes_mode = [
+            basin_to_node(
+                basin,
+                slab_n=int(slab_n),
+                cfg=cfg_mode,
+                energy_min_ev=energy_min,
+                surface_reference=surface_reference,
+            )
+            for basin in basins
+        ]
+        rows_mode = []
+        for basin, node in zip(basins, nodes_mode, strict=True):
+            rows_mode.append(
+                {
+                    "basin_id": int(basin.basin_id),
+                    "signature": str(basin.signature),
+                    "energy_ev": float(basin.energy_ev),
+                    "node_id": str(node.node_id),
+                    "node_id_legacy": str(node.node_id_legacy),
+                    "surface_env_key": ("" if node.surface_env_key is None else str(node.surface_env_key)),
+                    "surface_geometry_key": ("" if node.surface_geometry_key is None else str(node.surface_geometry_key)),
+                }
+            )
+        rows_by_mode[str(mode)] = rows_mode
+
+    grouped_by_mode = {mode: _group_node_rows(rows, "node_id") for mode, rows in rows_by_mode.items()}
+    observed_lookup = {int(r["basin_id"]): r for r in rows_observed}
+    legacy_lookup = {int(r["basin_id"]): r for r in rows_by_mode.get("legacy_absolute", [])}
+    split_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows_by_mode.get("surface_geometry", []):
+        split_groups.setdefault(str(row["surface_geometry_key"]), []).append(row)
+
+    redundant_splits = []
+    for key, group in sorted(split_groups.items(), key=lambda kv: (min(float(x["energy_ev"]) for x in kv[1]), kv[0])):
+        basin_ids = [int(x["basin_id"]) for x in group]
+        observed_ids = sorted({str(observed_lookup[int(bid)]["node_id"]) for bid in basin_ids if int(bid) in observed_lookup})
+        if len(observed_ids) <= 1:
+            continue
+        energies = [float(x["energy_ev"]) for x in group]
+        redundant_splits.append(
+            {
+                "surface_geometry_key": str(key),
+                "basin_ids": basin_ids,
+                "observed_node_ids": observed_ids,
+                "legacy_node_ids": sorted(
+                    {str(legacy_lookup[int(bid)]["node_id"]) for bid in basin_ids if int(bid) in legacy_lookup}
+                ),
+                "signatures": sorted({str(x["signature"]) for x in group}),
+                "energy_min_ev": float(min(energies)),
+                "energy_max_ev": float(max(energies)),
+                "energy_span_ev": float(max(energies) - min(energies)),
+            }
+        )
+
+    observed_count = len(grouped_by_mode["observed"]) if rows_observed else 0
+    legacy_count = len(grouped_by_mode.get("legacy_absolute", []))
+    geom_count = len(grouped_by_mode.get("surface_geometry", []))
+    redundant_split_basin_count = int(sum(len(group["basin_ids"]) for group in redundant_splits))
+    return {
+        "current_node_identity_mode": str(cfg_use.node_identity_mode),
+        "counts": {
+            "basins": int(len(basins)),
+            "observed_node_ids": int(observed_count),
+            "legacy_absolute": int(legacy_count),
+            "surface_geometry": int(geom_count),
+            "inflation_observed_vs_surface_geometry": int(observed_count - geom_count),
+            "inflation_legacy_vs_surface_geometry": int(legacy_count - geom_count),
+            "redundant_surface_geometry_split_groups": int(len(redundant_splits)),
+            "redundant_surface_geometry_split_basins": int(redundant_split_basin_count),
+        },
+        "rows_by_mode": rows_by_mode,
+        "groups": grouped_by_mode,
+        "redundant_surface_geometry_splits": redundant_splits,
+    }
